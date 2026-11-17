@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""audio-doctor: find where audio stops, hop by hop, in ~3 seconds.
+
+Chain checked (in order):
+  services   pipewire / pipewire-pulse / wireplumber running
+  hardware   USB + ALSA cards present, card profile not "off", BT audio
+  routing    default sink, every app stream -> sink -> (loopback) -> hardware sink
+  signal     REAL peak level measured on every app stream and every running sink
+  device     RME ADI-2 Pro state via `adi2` (mute, volume, phones plugged, faults)
+  staleness  apps started before the last PipeWire restart (stale audio engine)
+
+  audio-doctor              full diagnosis, verdict first
+  audio-doctor --json       machine-readable
+  audio-doctor --tone       also play a quiet -30 dBFS 440 Hz tone into the default
+                            sink and confirm it arrives at the hardware sink
+  audio-doctor --app NAME   only streams whose app/media name matches NAME
+  audio-doctor --secs 1.0   metering window (default 1.0 s)
+"""
+import json, math, os, re, shutil, subprocess as sp, sys, tempfile, threading, time
+from array import array
+
+SILENT_DB = -90.0
+ARGS = sys.argv[1:]
+JSON = "--json" in ARGS
+TONE = "--tone" in ARGS
+SECS = float(ARGS[ARGS.index("--secs") + 1]) if "--secs" in ARGS else 1.0
+APP = ARGS[ARGS.index("--app") + 1].lower() if "--app" in ARGS else None
+
+def run(cmd, timeout=6):
+    try:
+        return sp.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+findings = []  # (severity, hop, message, fix)
+def find(sev, hop, msg, fix=""):
+    findings.append({"severity": sev, "hop": hop, "message": msg, "fix": fix})
+
+# ------------------------------------------------------------------ services
+def services():
+    out = {}
+    for u in ("pipewire", "pipewire-pulse", "wireplumber"):
+        st = run(["systemctl", "--user", "is-active", u]).strip()
+        ts = run(["systemctl", "--user", "show", u, "-p", "ActiveEnterTimestampMonotonic", "--value"]).strip()
+        out[u] = {"state": st, "since_mono_us": int(ts) if ts.isdigit() else 0}
+        if st != "active":
+            find("BREAK", "services", f"{u} is {st or 'unknown'}", f"systemctl --user restart {u}")
+    return out
+
+# ------------------------------------------------------------------ hardware
+def hardware():
+    cards = []
+    for line in open("/proc/asound/cards").read().splitlines():
+        m = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]:\s*(.*)", line)
+        if m: cards.append({"index": int(m[1]), "id": m[2], "desc": m[3]})
+    usb_audio = []
+    for d in os.listdir("/sys/bus/usb/devices"):
+        p = f"/sys/bus/usb/devices/{d}"
+        if ":" in d and open(f"{p}/bInterfaceClass").read().strip() == "01":
+            parent = p.rsplit("/", 1)[0] + "/" + d.split(":")[0]
+            try: name = open(f"{parent}/product").read().strip()
+            except OSError: name = d
+            if name not in usb_audio: usb_audio.append(name)
+    bt = []
+    out = run(["bluetoothctl", "devices", "Connected"], timeout=3)
+    for l in out.splitlines():
+        if l.startswith("Device "): bt.append(l.split(" ", 2)[2])
+    return {"alsa_cards": cards, "usb_audio": usb_audio, "bt_connected": bt}
+
+# ------------------------------------------------------------------ pipewire graph
+def pactl_json(what):
+    try: return json.loads(run(["pactl", "-f", "json", "list", what]) or "[]")
+    except json.JSONDecodeError: return []
+
+def vol_pct(v):
+    try:
+        vals = [int(str(c.get("value_percent", "0")).rstrip("%")) for c in v.values()]
+        return min(vals) if vals else None
+    except Exception:
+        return None
+
+def graph():
+    dump = json.loads(run(["pw-dump"], timeout=8) or "[]")
+    nodes, ports, links = {}, {}, []
+    for o in dump:
+        t, info = o.get("type", ""), o.get("info") or {}
+        props = info.get("props", {}) if isinstance(info, dict) else {}
+        if t.endswith("Node"): nodes[o["id"]] = {"id": o["id"], "props": props, "state": info.get("state")}
+        elif t.endswith("Port"): ports[o["id"]] = {"node": props.get("node.id"), "dir": props.get("port.direction"), "name": props.get("port.name")}
+        elif t.endswith("Link"): links.append({"out_node": info.get("output-node-id"), "in_node": info.get("input-node-id"), "state": info.get("state")})
+        elif t.endswith("Metadata") and props.get("metadata.name") == "default":
+            for m in o.get("metadata") or []:
+                if m.get("key") in ("default.audio.sink", "default.audio.source"):
+                    val = m.get("value")
+                    nodes.setdefault("_defaults", {})[m["key"]] = val.get("name") if isinstance(val, dict) else val
+    return nodes, links
+
+def downstream(node_id, links):
+    return sorted({l["in_node"] for l in links if l["out_node"] == node_id})
+
+def upstream(node_id, links):
+    return sorted({l["out_node"] for l in links if l["in_node"] == node_id})
+
+# ------------------------------------------------------------------ metering
+def meter(targets):
+    """targets: (key, target, channels, kind) kind='sink' (capture its monitor) or 'stream'
+    (unconnected recorder wired to the stream's output ports). Records to temp files
+    (pipes stall at 64 KB). Returns {key: peak_db}."""
+    tmp = tempfile.mkdtemp(prefix="audio-doctor-")
+    procs = {}
+    for i, (key, target, ch, kind) in enumerate(targets):
+        f = os.path.join(tmp, f"{i}.raw")
+        cmd = ["pw-record", "--raw", "--format", "f32", "--channels", str(ch)]
+        if kind == "sink":
+            cmd += ["--target", str(target), "-P", "{ stream.capture.sink=true node.name=adoc-%d }" % i]
+        else:
+            cmd += ["-P", "{ node.autoconnect=false node.name=adoc-%d }" % i]
+        cmd.append(f)
+        procs[key] = (sp.Popen(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL), f, ch, target, kind, i)
+    # wire stream recorders to their stream's output ports
+    if any(t[3] == "stream" for t in targets):
+        for _ in range(10):
+            time.sleep(0.1)
+            d = json.loads(run(["pw-dump"], timeout=8) or "[]")
+            names = {o["info"]["props"].get("node.name"): o["id"] for o in d if o.get("type", "").endswith("Node")}
+            if all(f"adoc-{v[5]}" in names for v in procs.values() if v[4] == "stream"): break
+        ports = [(o["id"], o["info"]["props"]) for o in d if o.get("type", "").endswith("Port")]
+        def pl(nid, direction):
+            return [i for i, p in sorted(ports, key=lambda x: (str(x[1].get("audio.channel", "")), x[0]))
+                    if p.get("node.id") == nid and p.get("port.direction") == direction and not p.get("port.monitor")]
+        for key, (pr, f, ch, target, kind, i) in procs.items():
+            if kind != "stream" or f"adoc-{i}" not in names: continue
+            for a_, b_ in zip(pl(target, "out"), pl(names[f"adoc-{i}"], "in")):
+                run(["pw-link", str(a_), str(b_)], timeout=3)
+    time.sleep(SECS + 0.2)
+    res = {}
+    for key, (pr, f, ch, *_ ) in procs.items():
+        pr.terminate()
+        try: pr.wait(2)
+        except Exception: pr.kill()
+        try: data = open(f, "rb").read()
+        except OSError: res[key] = None; continue
+        a = array("f"); a.frombytes(data[: len(data) // 4 * 4])
+        skip = int(48000 * 0.1) * ch  # ignore startup transient
+        a = a[skip:] if len(a) > skip * 2 else a
+        pk = max((abs(x) for x in a if x == x), default=0.0)
+        res[key] = round(20 * math.log10(pk), 1) if pk > 1e-9 else float("-inf")
+        os.unlink(f)
+    os.rmdir(tmp)
+    return res
+
+def fmt_db(v):
+    if v is None: return "n/a"
+    return "SILENT" if v == float("-inf") or v < SILENT_DB else f"{v:+.1f} dBFS"
+
+def silent(v):
+    return v is None or v == float("-inf") or v < SILENT_DB
+
+# ------------------------------------------------------------------ RME ADI-2
+def rme_check(hw):
+    if not any("ADI-2" in c["desc"] for c in hw["alsa_cards"]) or not shutil.which("adi2"):
+        return None
+    try:
+        state = json.loads(run(["adi2", "dump", "--json"], timeout=12) or "{}")
+        st = state.pop("_status", {}) or {}
+    except json.JSONDecodeError:
+        find("WARN", "device", "ADI-2 present but did not answer over MIDI", "check MIDI Control is on in the device menu; replug USB")
+        return None
+    line, ph12, dev = state.get("line", {}), state.get("ph12", {}), state.get("device", {})
+    out = {"status": st, "line": {k: line.get(k) for k in ("volume", "mute", "dim", "source")},
+           "ph12_volume": ph12.get("volume"), "basic_mode": dev.get("basic_mode")}
+    if st.get("power_fail"): find("BREAK", "device", "ADI-2 reports POWER FAIL", "check its PSU")
+    for k in ("phones1_overcurrent", "phones2_overcurrent", "dc_error_phones1", "dc_error_phones2"):
+        if st.get(k): find("BREAK", "device", f"ADI-2 fault: {k}", "unplug phones, check cable")
+    if not st.get("phones1_plugged") and not st.get("phones2_plugged"):
+        find("WARN", "device", "ADI-2: no headphones detected in either phones jack")
+    if line.get("mute") == "on": find("BREAK", "device", "ADI-2 line/phones 1/2 is MUTED on the device", "adi2 set line.mute off")
+    if line.get("dim") == "on": find("WARN", "device", "ADI-2 DIM is on", "adi2 set line.dim off")
+    v = line.get("volume")
+    if isinstance(v, (int, float)) and v <= -70:
+        find("WARN", "device", f"ADI-2 volume (front knob) is {v} dB, effectively inaudible", "turn the knob up (don't let an agent jump it)")
+    src = line.get("source")
+    if src not in (None, "auto", "usb1/2"):
+        find("BREAK", "device", f"ADI-2 output 1/2 source is '{src}', not USB", "adi2 set line.source auto")
+    return out
+
+# ------------------------------------------------------------------ process ages
+def proc_start_mono_us(pid):
+    try:
+        f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        return int(int(f[19]) / os.sysconf("SC_CLK_TCK") * 1e6)
+    except Exception:
+        return None
+
+AUDIO_APPS = re.compile(r"firefox|chromium|chrome|brave|spotify|mpv|vlc|discord|Ableton|obs", re.I)
+
+# ------------------------------------------------------------------ main
+def main():
+    t0 = time.time()
+    svc = services()
+    hw = hardware()
+    nodes, links = graph()
+    defaults = nodes.pop("_defaults", {})
+    def_sink = run(["pactl", "get-default-sink"]).strip() or defaults.get("default.audio.sink")
+    sinks = {s["name"]: s for s in pactl_json("sinks")}
+    inputs = pactl_json("sink-inputs")
+    cards = pactl_json("cards")
+    by_name = {n["props"].get("node.name"): n for n in nodes.values()}
+
+    # card profiles
+    for c in cards:
+        if c.get("active_profile") == "off":
+            find("WARN", "hardware", f"card '{c['properties'].get('device.description', c['name'])}' profile is OFF", f"pactl set-card-profile {c['name']} <profile>")
+    if def_sink not in sinks:
+        find("BREAK", "routing", f"default sink '{def_sink}' does not exist", "pactl set-default-sink <sink>")
+
+    # streams
+    streams = []
+    for si in inputs:
+        p = si.get("properties", {})
+        app = p.get("application.name") or p.get("node.name") or "?"
+        media = p.get("media.name", "")
+        if p.get("node.passive") == "true" or app == "?" and "loopback" in p.get("node.name", ""):
+            continue  # internal loopback legs
+        if media.endswith(" output") and p.get("node.name", "").endswith(".out"):
+            continue
+        if APP and APP not in app.lower() and APP not in media.lower():
+            continue
+        nid = int(p.get("object.id", -1))
+        sink_name = next((n for n, s in sinks.items() if s["index"] == si.get("sink")), None)
+        ch = si.get("channel_map", "").count(",") + 1 if si.get("channel_map") else 2
+        streams.append({"node": nid, "app": app, "media": media, "pid": p.get("application.process.id"),
+                        "sink": sink_name, "mute": si.get("mute"), "volume_pct": vol_pct(si.get("volume", {})),
+                        "corked": si.get("corked"), "channels": min(ch, 8),
+                        "linked_to": [nodes.get(d, {}).get("props", {}).get("node.name") for d in downstream(nid, links)]})
+
+    # which sinks to meter: running ones + every sink a stream points at + default
+    want_sinks = {s["sink"] for s in streams if s["sink"]} | {def_sink}
+    for n, s in sinks.items():
+        if s.get("state") == "RUNNING": want_sinks.add(n)
+    # follow virtual sinks to hardware: sink -> its loopback stream -> hw sink
+    hops = {}
+    for n in list(want_sinks):
+        node = by_name.get(n)
+        if not node: continue
+        if not n.startswith(("alsa_output", "bluez_output")):
+            # capture side of a loopback named X has a sibling X.out stream whose links lead to hw
+            out = by_name.get(n + ".out")
+            if out:
+                hw_targets = [nodes[d]["props"].get("node.name") for d in downstream(out["id"], links) if d in nodes]
+                hops[n] = hw_targets
+                want_sinks.update(hw_targets)
+
+    targets = [("stream:%d" % s["node"], s["node"], s["channels"], "stream") for s in streams]
+    for n in want_sinks:
+        if n in sinks:
+            ch = min(sinks[n].get("channel_map", "").count(",") + 1, 8)
+            targets.append(("sink:" + n, n, ch, "sink"))
+
+    tone_proc = None
+    if TONE and def_sink:
+        tf = os.path.join(tempfile.gettempdir(), "audio-doctor-tone.wav")
+        if not os.path.exists(tf):
+            sp.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=3,volume=-30dB", "-ac", "2", tf])
+        tone_proc = sp.Popen(["pw-play", "--target", def_sink, tf], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        time.sleep(0.4)
+    rme_box = {}
+    rt = threading.Thread(target=lambda: rme_box.update(r=rme_check(hw))); rt.start()
+    levels = meter(targets)
+    if tone_proc:
+        tone_proc.terminate()
+
+    for s in streams:
+        s["level"] = levels.get("stream:%d" % s["node"])
+    sink_info = {}
+    for n in want_sinks:
+        if n not in sinks: continue
+        s = sinks[n]
+        sink_info[n] = {"desc": s.get("description"), "state": s.get("state"), "mute": s.get("mute"),
+                        "volume_pct": vol_pct(s.get("volume", {})), "level": levels.get("sink:" + n),
+                        "feeds_hardware": hops.get(n), "default": n == def_sink}
+        if s.get("mute"): find("BREAK", "sink", f"sink '{s.get('description')}' is MUTED", f"pactl set-sink-mute {n} 0")
+        v = sink_info[n]["volume_pct"]
+        if v is not None and v <= 2: find("BREAK", "sink", f"sink '{s.get('description')}' volume is {v}%", f"pactl set-sink-volume {n} 50%")
+        if n in hops and not hops[n]:
+            find("BREAK", "routing", f"virtual sink '{s.get('description')}' is not linked to any hardware sink", "check the loopback target (device unplugged or renamed?)")
+
+    # stream verdicts
+    pw_start = svc.get("pipewire-pulse", {}).get("since_mono_us") or svc.get("pipewire", {}).get("since_mono_us")
+    for s in streams:
+        tag = f"{s['app']} [{s['media'][:40]}]"
+        if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
+        elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
+        if not s["linked_to"]: find("BREAK", "routing", f"{tag} is not linked to any sink")
+        elif s["sink"] and s["sink"] != def_sink: find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
+        if s["corked"]: find("INFO", "stream", f"{tag} is paused (corked) by the app")
+        elif silent(s["level"]):
+            st = proc_start_mono_us(s["pid"]) if s["pid"] else None
+            if st and pw_start and st < pw_start:
+                find("BREAK", "app", f"{tag} is connected but sending silence, and the app started BEFORE the last PipeWire restart: its audio engine is stale",
+                     "restart the app (browser: full quit + reopen)")
+            else:
+                find("INFO", "app", f"{tag} is connected but sending silence (nothing playing, tab/app muted, or app audio stuck)", "play something; if still silent, reload tab or restart the app")
+        else:
+            sk = sink_info.get(s["sink"], {})
+            if silent(sk.get("level")):
+                find("BREAK", "sink", f"{tag} has signal ({fmt_db(s['level'])}) but sink '{s['sink']}' is silent")
+            for hwn in (sk.get("feeds_hardware") or []):
+                if silent(sink_info.get(hwn, {}).get("level")):
+                    find("BREAK", "routing", f"signal reaches '{s['sink']}' but not hardware sink '{hwn}'", "check loopback links in qpwgraph")
+
+    # audio apps running with no stream at all
+    stream_pids = {str(s["pid"]) for s in streams}
+    seen = set()
+    for line in run(["ps", "-eo", "pid=,stat=,comm="]).splitlines():
+        pid, stat, comm = line.strip().split(None, 2)
+        if stat.startswith("Z") or "crashpad" in comm or "helper" in comm: continue
+        if AUDIO_APPS.search(comm) and comm not in seen:
+            seen.add(comm)
+            if pid not in stream_pids and not any(comm.lower() in (s["app"] or "").lower() for s in streams):
+                st = proc_start_mono_us(pid)
+                stale = st and pw_start and st < pw_start
+                find("WARN" if stale else "INFO", "app",
+                     f"{comm} is running but has NO audio stream" + (" and started BEFORE the last PipeWire restart (stale audio engine likely)" if stale else " (nothing playing?)"),
+                     "restart it" if stale else "start playback; if no stream appears, restart the app")
+
+    # tone test
+    if TONE:
+        ok = not silent(sink_info.get(def_sink, {}).get("level"))
+        hw_ok = all(not silent(sink_info.get(h, {}).get("level")) for h in (sink_info.get(def_sink, {}).get("feeds_hardware") or [def_sink]))
+        if not ok: find("BREAK", "tone", f"test tone did not show up on default sink '{def_sink}'")
+        elif not hw_ok: find("BREAK", "tone", "test tone reached the default sink but not the hardware sink")
+        else: find("OK", "tone", "test tone reached the hardware sink: PipeWire path is good; if you still hear nothing, it's the device/cable/headphones")
+
+    rt.join(); rme = rme_box.get("r")
+
+    order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
+    findings.sort(key=lambda f: order[f["severity"]])
+    report = {"took_s": round(time.time() - t0, 1), "default_sink": def_sink, "services": svc, "hardware": hw,
+              "sinks": sink_info, "streams": streams, "rme": rme, "findings": findings}
+    if JSON:
+        print(json.dumps(report, indent=1, default=str)); return
+    breaks = [f for f in findings if f["severity"] == "BREAK"]
+    print("VERDICT: " + (f"BROKEN at {breaks[0]['hop']}: {breaks[0]['message']}" if breaks else "no break found in the chain"))
+    for f in findings:
+        print(f"  [{f['severity']:5}] {f['hop']:8} {f['message']}" + (f"\n{'':18}fix: {f['fix']}" if f["fix"] else ""))
+    print(f"\nservices: " + ", ".join(f"{k}={v['state']}" for k, v in svc.items()))
+    print("hardware: usb audio = " + (", ".join(hw["usb_audio"]) or "none") + " | bt = " + (", ".join(hw["bt_connected"]) or "none"))
+    print(f"default sink: {def_sink}")
+    print("\nsinks (measured):")
+    for n, s in sink_info.items():
+        print(f"  {'*' if s['default'] else ' '} {s['desc'][:48]:48} {s['state']:9} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}  level {fmt_db(s['level'])}"
+              + (f"\n      -> feeds {', '.join(s['feeds_hardware'])}" if s["feeds_hardware"] else ""))
+    print("\napp streams (measured):")
+    for s in streams:
+        print(f"  {s['app'][:14]:14} {s['media'][:34]:34} -> {str(s['sink'])[:30]:30} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}{' PAUSED' if s['corked'] else ''}  level {fmt_db(s['level'])}")
+    if not streams: print("  (none)")
+    if rme:
+        st = rme["status"]
+        print(f"\nRME ADI-2: mode {rme['basic_mode']}, knob/line vol {rme['line']['volume']} dB, mute {rme['line']['mute']}, source {rme['line']['source']}, "
+              f"phones1 {'plugged' if st.get('phones1_plugged') else 'empty'}, phones2 {'plugged' if st.get('phones2_plugged') else 'empty'}, clock {st.get('clock_source')}")
+    print(f"\n({report['took_s']} s)")
+
+if __name__ == "__main__":
+    main()
