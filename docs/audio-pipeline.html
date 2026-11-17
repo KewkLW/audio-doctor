@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Omarchy Studio Audio Pipeline</title>
+<style>
+:root{
+  --bg:#12110f; --panel:#1b1916; --panel2:#23201c; --ink:#ece6dc; --dim:#a39a8c; --line:#3a352e;
+  --app:#7fb4ff; --pw:#c79bff; --wp:#ff9bd2; --kern:#ffb86b; --usb:#ffd76b; --dev:#7ee0a1; --ear:#ff7a7a; --midi:#6fe3e3;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){--bg:#f7f4ee;--panel:#fff;--panel2:#f1ece3;--ink:#1d1b18;--dim:#6b6358;--line:#d8d0c3;
+  --app:#2f6fd6;--pw:#7a3fd1;--wp:#c0388a;--kern:#c46a12;--usb:#a17a00;--dev:#1e9a52;--ear:#d23c3c;--midi:#0f9a9a;}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 80px}
+h1{font-size:28px;margin:0 0 4px}
+h2{font-size:21px;margin:44px 0 12px;padding-top:8px;border-top:1px solid var(--line)}
+h3{font-size:17px;margin:0 0 6px}
+p.lead{color:var(--dim);margin:0 0 20px;font-size:17px}
+code{font:13.5px ui-monospace,Menlo,monospace;background:var(--panel2);padding:1px 6px;border-radius:5px}
+.diagram{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;overflow-x:auto}
+.diagram svg{display:block;min-width:760px;width:100%;height:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-left:5px solid var(--c);border-radius:12px;padding:14px 16px}
+.card .tag{display:inline-block;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--c);margin-bottom:4px}
+.card p{margin:6px 0}
+.card ul{margin:6px 0 0;padding-left:18px}
+.analogy{color:var(--dim);font-style:italic}
+table{width:100%;border-collapse:collapse;background:var(--panel);border-radius:12px;overflow:hidden;font-size:15px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--panel2);font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:700;color:#111}
+.callout{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:14px 0}
+.small{font-size:14px;color:var(--dim)}
+</style>
+</head>
+<body>
+<main>
+<h1>Your audio pipeline, end to end</h1>
+<p class="lead">How a YouTube tab gets to your ears on this machine. Six layers, read top to bottom. Every box in the diagram is a real thing on your machine right now.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 1000 1010" role="img" aria-label="Audio pipeline diagram from apps down to headphones">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+  </defs>
+  <style>
+    .box{fill:var(--panel2);stroke-width:2.5;rx:12}
+    .t{fill:var(--ink);font:600 16px system-ui,sans-serif}
+    .s{fill:var(--dim);font:13px system-ui,sans-serif}
+    .lay{font:800 12px system-ui,sans-serif;letter-spacing:.08em}
+    .flow{stroke-width:3;fill:none}
+    .band{opacity:.07}
+  </style>
+
+  <!-- layer bands -->
+  <rect x="0" y="0" width="1000" height="118" fill="var(--app)" class="band"/>
+  <rect x="0" y="118" width="1000" height="292" fill="var(--pw)" class="band"/>
+  <rect x="0" y="410" width="1000" height="150" fill="var(--kern)" class="band"/>
+  <rect x="0" y="560" width="1000" height="90" fill="var(--usb)" class="band"/>
+  <rect x="0" y="650" width="1000" height="250" fill="var(--dev)" class="band"/>
+  <rect x="0" y="900" width="1000" height="110" fill="var(--ear)" class="band"/>
+
+  <text x="14" y="24" class="lay" fill="var(--app)">1 · APPS</text>
+  <text x="14" y="142" class="lay" fill="var(--pw)">2 · PIPEWIRE (sound server)</text>
+  <text x="14" y="434" class="lay" fill="var(--kern)">3 · KERNEL: ALSA + driver</text>
+  <text x="14" y="584" class="lay" fill="var(--usb)">4 · USB CABLE</text>
+  <text x="14" y="674" class="lay" fill="var(--dev)">5 · RME ADI-2 PRO (the box)</text>
+  <text x="14" y="924" class="lay" fill="var(--ear)">6 · YOUR EARS</text>
+
+  <!-- apps -->
+  <rect x="150" y="36" width="210" height="64" class="box" stroke="var(--app)"/>
+  <text x="166" y="62" class="t">Browser tab</text><text x="166" y="84" class="s">YouTube, X, MPC page</text>
+  <rect x="395" y="36" width="210" height="64" class="box" stroke="var(--app)"/>
+  <text x="411" y="62" class="t">Discord web app</text><text x="411" y="84" class="s">chromium --app=discord</text>
+  <rect x="640" y="36" width="210" height="64" class="box" stroke="var(--app)"/>
+  <text x="656" y="62" class="t">DAW / games</text><text x="656" y="84" class="s">Bitwig, Ableton, Wine</text>
+
+  <!-- pipewire-pulse -->
+  <rect x="150" y="160" width="455" height="56" class="box" stroke="var(--pw)"/>
+  <text x="166" y="185" class="t">pipewire-pulse</text><text x="166" y="205" class="s">translator: apps speak "PulseAudio", this converts to PipeWire</text>
+  <rect x="640" y="160" width="210" height="56" class="box" stroke="var(--pw)"/>
+  <text x="656" y="185" class="t">JACK / native</text><text x="656" y="205" class="s">DAWs connect directly</text>
+
+  <!-- sink -->
+  <rect x="150" y="240" width="700" height="62" class="box" stroke="var(--pw)"/>
+  <text x="166" y="266" class="t">"RME Phones 1/2"  (virtual stereo sink, your default)</text>
+  <text x="166" y="288" class="s">every app is MIXED here · per-app volume · resampled to 48 kHz · 2 channels FL/FR</text>
+  <rect x="150" y="326" width="700" height="62" class="box" stroke="var(--pw)"/>
+  <text x="166" y="352" class="t">loopback → "ADI-2 Pro (Pro)"  hardware sink, 8 channels AUX0–AUX7</text>
+  <text x="166" y="374" class="s">FL → AUX0 · FR → AUX1   (this is what you saw wired in qpwgraph)</text>
+
+  <!-- wireplumber side -->
+  <rect x="872" y="160" width="118" height="228" class="box" stroke="var(--wp)"/>
+  <text x="884" y="186" class="t">WirePlumber</text>
+  <text x="884" y="210" class="s">the "brain":</text>
+  <text x="884" y="230" class="s">picks profiles</text>
+  <text x="884" y="250" class="s">picks default</text>
+  <text x="884" y="270" class="s">auto-wires new</text>
+  <text x="884" y="290" class="s">streams</text>
+  <text x="884" y="310" class="s">remembers</text>
+  <text x="884" y="330" class="s">volumes</text>
+
+  <!-- kernel -->
+  <rect x="150" y="448" width="455" height="92" class="box" stroke="var(--kern)"/>
+  <text x="166" y="474" class="t">ALSA "card 2"  ·  hw:2,0</text>
+  <text x="166" y="496" class="s">the kernel's sound layer. A raw pipe of samples:</text>
+  <text x="166" y="516" class="s">8 ch · 32-bit · 48000/s · one owner (PipeWire)</text>
+  <rect x="640" y="448" width="210" height="92" class="box" stroke="var(--kern)"/>
+  <text x="656" y="474" class="t">snd-usb-audio</text>
+  <text x="656" y="496" class="s">the driver: turns</text>
+  <text x="656" y="516" class="s">ALSA into USB packets</text>
+
+  <!-- usb -->
+  <rect x="150" y="590" width="700" height="44" class="box" stroke="var(--usb)"/>
+  <text x="166" y="618" class="t">USB 2.0  ·  a packet every 125 µs  ·  288 bytes each  ·  + MIDI side channel</text>
+
+  <!-- device -->
+  <rect x="150" y="690" width="210" height="90" class="box" stroke="var(--dev)"/>
+  <text x="166" y="716" class="t">USB receiver</text><text x="166" y="738" class="s">"USB 1/2" = your audio</text><text x="166" y="758" class="s">source: auto → USB</text>
+  <rect x="395" y="690" width="210" height="90" class="box" stroke="var(--dev)"/>
+  <text x="411" y="716" class="t">DSP</text><text x="411" y="738" class="s">volume knob, EQ, mute,</text><text x="411" y="758" class="s">crossfeed, loudness</text>
+  <rect x="640" y="690" width="210" height="90" class="box" stroke="var(--dev)"/>
+  <text x="656" y="716" class="t">DAC + amp</text><text x="656" y="738" class="s">numbers → voltage</text><text x="656" y="758" class="s">Hi-Power phones amp</text>
+  <rect x="395" y="806" width="455" height="70" class="box" stroke="var(--dev)"/>
+  <text x="411" y="832" class="t">Phones 1/2 jack</text><text x="411" y="854" class="s">analog electrical signal from here on</text>
+
+  <!-- ears -->
+  <rect x="395" y="930" width="455" height="60" class="box" stroke="var(--ear)"/>
+  <text x="411" y="956" class="t">Headphones</text><text x="411" y="976" class="s">voltage moves the drivers → air → you</text>
+
+  <!-- flows -->
+  <g color="var(--app)" stroke="var(--app)">
+    <path class="flow" d="M255 100 V156" marker-end="url(#ar)"/>
+    <path class="flow" d="M500 100 V156" marker-end="url(#ar)"/>
+    <path class="flow" d="M745 100 V156" marker-end="url(#ar)"/>
+  </g>
+  <g color="var(--pw)" stroke="var(--pw)">
+    <path class="flow" d="M378 216 V236" marker-end="url(#ar)"/>
+    <path class="flow" d="M745 216 V236" marker-end="url(#ar)"/>
+    <path class="flow" d="M500 302 V322" marker-end="url(#ar)"/>
+    <path class="flow" d="M378 388 V444" marker-end="url(#ar)"/>
+  </g>
+  <g color="var(--kern)" stroke="var(--kern)">
+    <path class="flow" d="M605 494 H636" marker-end="url(#ar)"/>
+    <path class="flow" d="M745 540 V586" marker-end="url(#ar)"/>
+  </g>
+  <g color="var(--usb)" stroke="var(--usb)">
+    <path class="flow" d="M255 634 V686" marker-end="url(#ar)"/>
+  </g>
+  <g color="var(--dev)" stroke="var(--dev)">
+    <path class="flow" d="M360 735 H391" marker-end="url(#ar)"/>
+    <path class="flow" d="M605 735 H636" marker-end="url(#ar)"/>
+    <path class="flow" d="M745 780 V802" marker-end="url(#ar)"/>
+    <path class="flow" d="M622 876 V926" marker-end="url(#ar)" stroke="var(--ear)" color="var(--ear)"/>
+  </g>
+  <g color="var(--wp)" stroke="var(--wp)" stroke-dasharray="6 5">
+    <path class="flow" d="M872 271 H854" marker-end="url(#ar)"/>
+  </g>
+</svg>
+</div>
+<p class="small">Arrows are the direction sound travels on playback. The microphone runs the same road upward: analog in → ADC → USB → ALSA capture → "RME In 1/2".</p>
+
+<h2>What each layer is, in plain words</h2>
+<div class="grid">
+  <div class="card" style="--c:var(--app)"><span class="tag">1 · Apps</span><h3>Make the sound</h3>
+    <p>A browser tab, Discord, a game. Each one hands over a stream of numbers (samples) and never touches the hardware itself.</p>
+    <p class="analogy">Musicians on stage.</p></div>
+  <div class="card" style="--c:var(--pw)"><span class="tag">2 · PipeWire</span><h3>The mixing desk</h3>
+    <p>One program that every app plugs into. It <b>mixes</b> all of them together, gives each its own volume fader, converts sample rates, and sends one combined signal to the device.</p>
+    <p>It's built as a <b>graph</b>: boxes (nodes) with sockets (ports) joined by wires (links). That's exactly what qpwgraph draws.</p>
+    <ul><li><b>pipewire-pulse</b>: a translator. The browser and Discord were written for an older server called PulseAudio. This lets them talk to PipeWire without knowing.</li>
+    <li><b>Sink</b> = a place sound goes (output). <b>Source</b> = a place sound comes from (mic).</li>
+    <li><b>RME Phones 1/2</b> is a <i>virtual</i> sink I created: a stereo front door that forwards into channels 1/2 of the real 8-channel device.</li></ul>
+    <p class="analogy">The mixing desk and its patch bay.</p></div>
+  <div class="card" style="--c:var(--wp)"><span class="tag">2b · WirePlumber</span><h3>The stage manager</h3>
+    <p>It doesn't carry sound. It makes decisions: which device is the default, which profile a card uses (it's what keeps your RME on "Pro Audio"), and it wires every new app to the default output automatically. It also remembers per-app volumes.</p>
+    <p class="analogy">The person who plugs cables in when a new musician walks on.</p></div>
+  <div class="card" style="--c:var(--kern)"><span class="tag">3 · ALSA + driver</span><h3>The kernel's sound layer</h3>
+    <p><b>ALSA</b> (Advanced Linux Sound Architecture) is the part of Linux itself that knows about sound hardware. Every sound device becomes a numbered <b>card</b>: your RME is <code>card 2</code>, its playback device <code>hw:2,0</code>.</p>
+    <p>ALSA is deliberately dumb: one program at a time, fixed format (8 channels, 32-bit, 48 kHz). No mixing, no per-app volume. That's why PipeWire sits on top and holds it.</p>
+    <p><b>snd-usb-audio</b> is the driver that turns those samples into USB packets. The RME is "class compliant", so this stock driver is the right one. RME makes no Linux driver.</p>
+    <p class="analogy">The power amp's input jack: one cable in, no mixing.</p></div>
+  <div class="card" style="--c:var(--usb)"><span class="tag">4 · USB</span><h3>The cable</h3>
+    <p>A packet every 125 microseconds (8000 per second) carries the next slice of audio. The RME sends back timing feedback, so the PC sends exactly as fast as the RME's own clock runs ("async" mode). That clean clocking is a big reason RME gear sounds good.</p>
+    <p>A separate <b>MIDI</b> channel rides the same cable. That's how <code>adi2</code> reads and changes the box's settings.</p></div>
+  <div class="card" style="--c:var(--dev)"><span class="tag">5 · ADI-2 Pro</span><h3>A computer of its own</h3>
+    <p>The box has its own routing (source: USB), a <b>DSP</b> that applies the volume knob, mute, EQ and crossfeed, then the <b>DAC</b> that turns numbers into voltage, and a headphone amp.</p>
+    <p>That's why "nothing coming out" can happen inside the box even when Linux is fine: it could be muted, turned down, or set to a different source. <code>adi2</code> can see all of that.</p></div>
+  <div class="card" style="--c:var(--ear)"><span class="tag">6 · Ears</span><h3>Analog from the jack on</h3>
+    <p>After the jack it's plain electricity. Cable, plug seated, headphones.</p></div>
+</div>
+
+<h2>Numbers on your setup</h2>
+<table>
+<tr><th>Thing</th><th>Value</th><th>Means</th></tr>
+<tr><td>Sample rate</td><td><code>48000 Hz</code> (PipeWire forced)</td><td>48,000 snapshots of the waveform per second per channel</td></tr>
+<tr><td>Inside PipeWire</td><td><code>float32</code></td><td>lossless working format for mixing</td></tr>
+<tr><td>To the RME</td><td><code>S32_LE × 8 ch</code></td><td>32-bit integers, 8 channels; only AUX0/AUX1 carry your audio</td></tr>
+<tr><td>Buffer (quantum)</td><td><code>1024 frames</code> ≈ 21 ms</td><td>how far ahead PipeWire works. Bigger = safer from crackles, more delay</td></tr>
+<tr><td>Device volume</td><td>front knob = <code>line.volume</code></td><td>Phones 1/2 shares the Line 1/2 converter on this box</td></tr>
+</table>
+
+<h2>The Bluetooth road is different</h2>
+<div class="callout">Your TMA-2 headphones skip layers 3–5 entirely: PipeWire → <b>BlueZ</b> (Linux Bluetooth) → radio → headphones. No ALSA card, no USB cable, and the audio is compressed (codec) before it leaves. That's why switching between RME and TMA-2 is just "which sink is default".</div>
+
+<h2>Where it breaks, and who catches it</h2>
+<table>
+<tr><th>Layer</th><th>Typical break</th><th>How you'd know</th></tr>
+<tr><td><span class="pill" style="background:var(--app)">App</span></td><td>tab muted, paused, or audio engine stale after a PipeWire restart (today's YouTube bug)</td><td><code>audio-doctor</code>: stream SILENT / no stream / "started before restart"</td></tr>
+<tr><td><span class="pill" style="background:var(--pw)">PipeWire</span></td><td>stream on the wrong sink, sink muted, a wire missing</td><td><code>audio-doctor</code> routing + level per hop; <code>qpwgraph</code> to see the wires</td></tr>
+<tr><td><span class="pill" style="background:var(--wp)">WirePlumber</span></td><td>wrong default, card profile "off"</td><td><code>audio-doctor</code> hardware/routing lines</td></tr>
+<tr><td><span class="pill" style="background:var(--kern)">ALSA/driver</span></td><td>device unplugged, card missing, USB errors</td><td><code>audio-doctor</code> hardware line; <code>journalctl -k</code></td></tr>
+<tr><td><span class="pill" style="background:var(--dev)">RME box</span></td><td>muted, knob down, source not USB, phones fault</td><td><code>audio-doctor</code> RME line (reads it over MIDI via <code>adi2</code>)</td></tr>
+<tr><td><span class="pill" style="background:var(--ear)">Analog</span></td><td>plug not seated, dead cable</td><td><code>audio-doctor --tone</code> reaches hardware but you hear nothing → it's this layer</td></tr>
+</table>
+
+<h2>Glossary</h2>
+<div class="grid">
+  <div class="card" style="--c:var(--dim)"><p><b>Sample</b>: one number = the speaker position at one instant.</p><p><b>Frame</b>: one sample for every channel at the same instant.</p><p><b>Channel</b>: one independent signal (left, right, AUX3…).</p></div>
+  <div class="card" style="--c:var(--dim)"><p><b>Node / port / link</b>: PipeWire's box / socket / wire.</p><p><b>Sink / source</b>: output / input.</p><p><b>Stream</b>: an app's connection to PipeWire.</p></div>
+  <div class="card" style="--c:var(--dim)"><p><b>Profile</b>: how a card's channels are presented ("Pro Audio" = raw numbered AUX channels).</p><p><b>Quantum</b>: PipeWire's chunk size per cycle.</p><p><b>Class compliant</b>: follows the USB audio standard, so no special driver needed.</p></div>
+</div>
+<p class="small" style="margin-top:28px">Generated 2026-11-16 for the studio machine · configs: <code>~/.config/wireplumber/wireplumber.conf.d/50-rme-adi2.conf</code>, <code>~/.config/pipewire/pipewire.conf.d/50-rme-adi2-stereo.conf</code></p>
+</main>
+</body>
+</html>
