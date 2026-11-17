@@ -317,11 +317,17 @@ def main():
         if stat.startswith("Z") or "crashpad" in comm or "helper" in comm: continue
         if AUDIO_APPS.search(comm) and comm not in seen:
             seen.add(comm)
+            try:
+                cl = open(f"/proc/{pid}/cmdline").read().split("\0")
+                app_url = next((a.split("=", 1)[1] for a in cl if a.startswith("--app=")), None)
+            except OSError:
+                app_url = None
+            label = f"{comm} web app {re.sub(r'^https?://([^/]+).*', r'\\1', app_url)}" if app_url else comm
             if pid not in stream_pids and not any(comm.lower() in (s["app"] or "").lower() for s in streams):
                 st = proc_start_mono_us(pid)
                 stale = st and pw_start and st < pw_start
                 find("WARN" if stale else "INFO", "app",
-                     f"{comm} is running but has NO audio stream" + (" and started BEFORE the last PipeWire restart (stale audio engine likely)" if stale else " (nothing playing?)"),
+                     f"{label} is running but has NO audio stream" + (" and started BEFORE the last PipeWire restart (stale audio engine likely)" if stale else " (nothing playing?)"),
                      "restart it" if stale else "start playback; if no stream appears, restart the app")
 
     # tone test
