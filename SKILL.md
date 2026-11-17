@@ -12,7 +12,23 @@ audio-doctor              # always start here (~2 s, passive, no sound made)
 audio-doctor --app youtube   # one app's streams only (matches app or tab/media name)
 audio-doctor --tone       # ALSO plays a quiet -30 dBFS 440 Hz tone into the default sink; tell the user first
 audio-doctor --json       # for scripting
+audio-doctor --fix        # relink streams/loopbacks whose target is back but unlinked, then diagnose
+audio-doctor --audit      # config audit only (= `config-audit`)
 ```
+
+## config-audit: catch config traps before they break audio
+`config-audit` (same repo, in ~/.local/bin, folded into every audio-doctor run as hop `config`) reads every PipeWire/WirePlumber drop-in (/usr/share, /etc, ~/.config) via `spa-json-dump` and compares it with the running graph. Run it after ANY PipeWire/WirePlumber config change, and as part of Omarchy Studio setup checks.
+| check | flags | why it matters |
+|---|---|---|
+| parse | a drop-in that does not parse | PipeWire may skip it or fail to start |
+| reconnect | `target.object` + `node.dont-reconnect` | after the target drops once (power cycle, replug) WirePlumber never relinks (2026-11-17 RME incident). Use `node.dont-fallback` + `node.linger` |
+| fallback | `node.dont-fallback` without `node.linger` | WirePlumber destroys the node while its target is missing |
+| target | target node missing right now, with the reason (device absent / card on wrong profile) | |
+| profile | target is a `pro-output/pro-input` node but no rule pins the card to pro-audio | only remembered state keeps it |
+| drift | disk config differs from the running node; WARN if the running node still has the reconnect trap | restart pending |
+| live | a stream with a present target and no links | `--fix` relinks by channel |
+| dupes / legacy | same node.name in two files; WirePlumber 0.4 `*.lua.d` dirs | |
+Verify a new loopback flag set without restarting PipeWire: `pw-loopback` against a `pactl load-module module-null-sink`, then unload/reload the sink (present -> gone -> back, cold start, capture direction).
 
 ## whatis: which app is that process really?
 `whatis` (same repo, symlinked into ~/.local/bin) names the real app behind generic process names. audio-doctor imports it to label every stream owner and app.
@@ -44,7 +60,8 @@ Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-prot
 | stream connected but SILENT + "started BEFORE the last PipeWire restart" | app's audio engine went stale when PipeWire restarted (2026-11-16 YT incident) | The user fully quits + reopens the app. Never kill the user's daily browser yourself |
 | "opened before the PipeWire restart ..., no audio connection: X, Y" | same: those apps lost their PipeWire connection in the restart | The user fully quits + reopens each one they want sound from |
 | sink MUTED / volume <=2% | mixer | `pactl set-sink-mute <sink> 0` |
-| virtual sink not linked to any hardware sink | RME unplugged/renamed, loopback target gone | replug; check `~/.config/pipewire/pipewire.conf.d/50-rme-adi2-stereo.conf` target.object; `systemctl --user restart pipewire` (warn: stales open apps!) |
+| virtual sink not linked to any hardware sink / `[BREAK] routing ... not linked although its target is present` | device power-cycled and the loopback did not relink (`node.dont-reconnect` trap, 2026-11-17) | `audio-doctor --fix` (pw-link by channel, no restart). Permanent: config uses `node.dont-fallback` + `node.linger` (adi2-control `config/`) |
+| virtual sink not linked, target missing | RME off/unplugged/renamed, or card not on pro-audio | power on/replug; `config-audit` names which; check target.object and the pro-audio rule |
 | signal at sink but not at hardware sink | loopback links broken | `pw-link rme_phones.out:output_AUX0 <hw>:playback_AUX0` (and AUX1) |
 | ADI-2 MUTED / DIM / source not USB | device state | `adi2 set line.mute off` etc. |
 | ADI-2 volume <= -70 dB | knob turned down | tell the user; never raise volume yourself |

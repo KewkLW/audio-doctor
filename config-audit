@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""config-audit: find PipeWire / WirePlumber config traps BEFORE they break audio.
+
+Reads every drop-in (/usr/share, /etc, ~/.config for pipewire, pipewire-pulse,
+client, client-rt, jack and wireplumber) through `spa-json-dump`, compares it with
+the running graph (`pw-dump`), and flags what will bite later:
+
+  parse      a drop-in that does not parse (PipeWire may refuse to start)
+  reconnect  target.object + node.dont-reconnect: once the target drops (device
+             power cycle, replug, profile change) the stream NEVER relinks
+             (WirePlumber linking/prepare-link.lua: was_handled + dont-reconnect).
+             Found 2026-11-17: RME powered off and back, rme_phones went silent.
+  fallback   node.dont-fallback without node.linger: WirePlumber DESTROYS the
+             node while the target is missing (linking/find-defined-target.lua)
+  target     target.object naming a node that does not exist right now, and why
+             (device absent, or card up on the wrong profile)
+  profile    target is a pro-audio node but no WirePlumber rule pins the card to
+             pro-audio (only remembered state keeps it; a reset breaks routing)
+  live       a running stream whose target exists but has no links: relink
+             commands, applied with --fix
+  drift      config on disk differs from the running node: restart pending
+  dupes      the same node.name defined in two files
+  legacy     WirePlumber 0.4 *.lua.d config dirs (ignored by 0.5)
+
+  config-audit            report
+  config-audit --fix      also relink live streams whose target is present
+  config-audit --json     machine-readable
+audio-doctor imports this file and folds the findings into its report.
+"""
+import glob, json, os, re, subprocess as sp, sys
+
+HOME = os.path.expanduser("~")
+XDG = os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
+ROOTS = ["/usr/share", "/etc", XDG]
+DROPINS = {"pipewire": ["pipewire.conf.d", "pipewire-pulse.conf.d", "client.conf.d",
+                        "client-rt.conf.d", "jack.conf.d"],
+           "wireplumber": ["wireplumber.conf.d"]}
+WATCH = ("target.object", "node.target", "node.dont-reconnect", "node.dont-fallback", "node.linger")
+RESTART_FIX = ("applies at the next PipeWire start: login/reboot, or `systemctl --user restart pipewire` "
+               "(that stales every open app's audio: run `whatis --audio` first, list what to reopen)")
+
+
+def run(cmd, timeout=8):
+    try:
+        return sp.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return sp.CompletedProcess(cmd, 1, "", str(e))
+
+
+def truthy(v):
+    return v is True or str(v).lower() in ("true", "1", "yes")
+
+
+def short(path):
+    return path.replace(HOME, "~")
+
+
+# ------------------------------------------------------------------ config side
+def conf_files():
+    """Effective drop-ins: a file with the same name in a later root replaces earlier ones."""
+    eff = {}
+    for app, dirs in DROPINS.items():
+        for d in dirs:
+            for root in ROOTS:
+                for f in sorted(glob.glob(os.path.join(root, app, d, "*.conf"))):
+                    eff[(app, d, os.path.basename(f))] = f
+    return sorted(eff.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
+
+
+def parse(path):
+    r = run(["spa-json-dump", path])
+    if r.returncode != 0 or not r.stdout.strip():
+        err = (r.stderr or "no output").strip().splitlines()
+        what = next((l.rsplit("': ", 1)[-1] for l in err if "error" in l), err[0] if err else "?")
+        where = next((l.split("|")[0].replace("line:", "line").strip() for l in err if l.startswith("line:")), "")
+        return None, [f"{what}{' at ' + where if where else ''}"]
+    try:
+        return json.loads(r.stdout), None
+    except json.JSONDecodeError as e:
+        return None, [str(e)]
+
+
+def walk(obj, path=()):
+    if isinstance(obj, dict):
+        yield path, obj
+        for k, v in obj.items():
+            yield from walk(v, path + (k,))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from walk(v, path + (i,))
+
+
+def config_streams(files):
+    """Every props block in config that names a target, plus every node.name it defines."""
+    streams, names = [], {}
+    for (app, d, base), f in files:
+        data = files_data.get(f)
+        if data is None:
+            continue
+        for p, blk in walk(data):
+            if not isinstance(blk.get("node.name"), str):
+                continue
+            # rule actions (update-props) also carry node.name keys only inside matches; skip rules
+            if any(isinstance(k, str) and k.endswith(".rules") for k in p):
+                continue
+            names.setdefault(blk["node.name"], []).append(f)
+            if "target.object" in blk or "node.target" in blk:
+                streams.append({"file": f, "node": blk["node.name"], "props": {k: blk.get(k) for k in WATCH if k in blk}})
+    return streams, names
+
+
+def profile_rules(files):
+    """(device.name pattern, profile) from monitor.alsa.rules update-props device.profile."""
+    out = []
+    for (app, d, base), f in files:
+        data = files_data.get(f) or {}
+        for rule in data.get("monitor.alsa.rules", []) or []:
+            prof = ((rule.get("actions") or {}).get("update-props") or {}).get("device.profile")
+            if not prof:
+                continue
+            for m in rule.get("matches", []) or []:
+                if "device.name" in m:
+                    out.append((m["device.name"], prof, f))
+    return out
+
+
+def pattern_hits(pat, value):
+    if isinstance(pat, str) and pat.startswith("~"):
+        try:
+            return re.search(pat[1:], value) is not None
+        except re.error:
+            return False
+    return pat == value
+
+
+files_data = {}
+
+
+# ------------------------------------------------------------------ live side
+def live_graph(dump=None):
+    if dump is None:
+        try:
+            dump = json.loads(run(["pw-dump"]).stdout or "[]")
+        except json.JSONDecodeError:
+            dump = []
+    nodes, ports, links, devices = {}, {}, [], {}
+    for o in dump:
+        t, info = o.get("type", ""), o.get("info") or {}
+        props = info.get("props", {}) if isinstance(info, dict) else {}
+        if t.endswith("Node"):
+            nodes[o["id"]] = props
+        elif t.endswith("Port"):
+            ports[o["id"]] = props
+        elif t.endswith("Link"):
+            links.append((info.get("output-node-id"), info.get("input-node-id")))
+        elif t.endswith("Device"):
+            devices[props.get("device.name")] = props
+    return nodes, ports, links, devices
+
+
+def card_profiles():
+    try:
+        cards = json.loads(run(["pactl", "-f", "json", "list", "cards"]).stdout or "[]")
+    except json.JSONDecodeError:
+        cards = []
+    return {c.get("name"): c.get("active_profile") for c in cards}
+
+
+def node_ports(ports, nid, direction):
+    out = {}
+    for pid, p in ports.items():
+        if p.get("node.id") == nid and p.get("port.direction") == direction and not truthy(p.get("port.monitor")):
+            out[p.get("audio.channel") or p.get("port.name")] = p.get("port.name")
+    return out
+
+
+def relink_cmds(nodes, ports, sid, tid):
+    """pw-link commands pairing the stream's ports with the target's by channel."""
+    s, t = nodes[sid], nodes[tid]
+    playback = "Output" in (s.get("media.class") or "")
+    s_ports = node_ports(ports, sid, "out" if playback else "in")
+    t_ports = node_ports(ports, tid, "in" if playback else "out")
+    cmds = []
+    for ch, sp_name in s_ports.items():
+        tp = t_ports.get(ch)
+        if not tp:
+            continue
+        a, b = f"{s['node.name']}:{sp_name}", f"{t['node.name']}:{tp}"
+        cmds.append(["pw-link", a, b] if playback else ["pw-link", b, a])
+    return cmds
+
+
+# ------------------------------------------------------------------ audit
+def audit(dump=None, fix=False):
+    findings = []
+
+    def find(sev, check, msg, fix_="", where=""):
+        findings.append({"severity": sev, "hop": "routing" if check == "live" else "config", "check": check, "message": msg, "fix": fix_, "file": where})
+
+    files = conf_files()
+    for _, f in files:
+        data, err = parse(f)
+        files_data[f] = data
+        if data is None:
+            find("BREAK", "parse", f"{short(f)} does not parse: {err[0]}", "fix the syntax; PipeWire/WirePlumber may skip it or fail to start", f)
+
+    for root in ROOTS[1:]:
+        for d in glob.glob(os.path.join(root, "wireplumber", "*.lua.d")):
+            find("WARN", "legacy", f"{short(d)} is WirePlumber 0.4 Lua config; 0.5 ignores it", "port it to a wireplumber.conf.d/*.conf rule", d)
+
+    streams, names = config_streams(files)
+    nodes, ports, links, devices = live_graph(dump)
+    by_name = {p.get("node.name"): nid for nid, p in nodes.items()}
+    profiles = card_profiles()
+    prules = profile_rules(files)
+
+    for name, fs in names.items():
+        if len(set(fs)) > 1:
+            find("WARN", "dupes", f"node.name '{name}' is defined in {len(set(fs))} files: " + ", ".join(short(f) for f in sorted(set(fs))),
+                 "keep one definition", fs[0])
+
+    for s in streams:
+        p, f, name = s["props"], s["file"], s["node"]
+        tgt = p.get("target.object") or p.get("node.target")
+        if "node.target" in p and "target.object" not in p:
+            find("INFO", "target", f"'{name}' uses deprecated node.target", "use target.object", f)
+        if truthy(p.get("node.dont-reconnect")):
+            find("WARN", "reconnect", f"'{name}' has target.object + node.dont-reconnect: after '{tgt}' disappears once "
+                 "(power cycle, replug, profile change) it never relinks and audio stops there",
+                 "replace node.dont-reconnect with node.dont-fallback = true + node.linger = true (waits for the target, never falls back)", f)
+        if truthy(p.get("node.dont-fallback")) and not truthy(p.get("node.linger")):
+            find("WARN", "fallback", f"'{name}' has node.dont-fallback without node.linger: WirePlumber destroys it while '{tgt}' is missing",
+                 "add node.linger = true", f)
+
+        # target present? if not, why
+        if isinstance(tgt, str) and tgt not in by_name:
+            m = re.match(r"alsa_(?:output|input)\.(.+)\.([^.]+)$", tgt)
+            why = "device absent (off, unplugged or renamed)"
+            if m:
+                card = "alsa_card." + m[1]
+                if card in devices or card in profiles:
+                    why = f"card is present but on profile '{profiles.get(card, '?')}', which has no '{m[2]}' node"
+            find("WARN", "target", f"'{name}' targets '{tgt}', which does not exist right now: {why}",
+                 "power on / replug the device, or fix the card profile or the target name", f)
+
+        # pro-audio node with nothing pinning the profile
+        if isinstance(tgt, str):
+            m = re.match(r"alsa_(?:output|input)\.(.+)\.pro-(?:output|input)-\d+$", tgt)
+            if m:
+                card = "alsa_card." + m[1]
+                if not any(pattern_hits(pat, card) and prof == "pro-audio" for pat, prof, _ in prules):
+                    find("WARN", "profile", f"'{name}' needs card '{card}' in pro-audio, but no WirePlumber rule pins that profile "
+                         "(only remembered state keeps it)",
+                         "add a monitor.alsa.rules entry: device.name = \"~" + re.escape(card).replace("\\-", "-") + "\" -> device.profile = \"pro-audio\"", f)
+
+        # drift between disk and the running node
+        nid = by_name.get(name)
+        if nid is None:
+            find("WARN", "drift", f"'{name}' is defined in {short(f)} but is not running", RESTART_FIX, f)
+        else:
+            live = nodes[nid]
+            diff = [k for k in WATCH if str(p.get(k, "")).lower() != str(live.get(k, "")).lower()]
+            if truthy(live.get("node.dont-reconnect")) and live.get("target.object") and not truthy(p.get("node.dont-reconnect")):
+                find("WARN", "drift", f"'{name}' is fixed on disk but the RUNNING node still has node.dont-reconnect: "
+                     "if its device drops before the next PipeWire start, it stays unlinked",
+                     "until then, after a device power cycle run `audio-doctor --fix`; " + RESTART_FIX, f)
+            elif diff:
+                find("INFO", "drift", f"'{name}' on disk differs from the running node ({', '.join(diff)}): restart pending", RESTART_FIX, f)
+
+    # live: streams with a present target but no links (the trap after it fired)
+    linked = {a for a, b in links} | {b for a, b in links}
+    for nid, p in nodes.items():
+        tgt = p.get("target.object") or p.get("node.target")
+        mc = p.get("media.class") or ""
+        if not tgt or not mc.startswith("Stream/") or nid in linked:
+            continue
+        tid = by_name.get(tgt) or (int(tgt) if str(tgt).isdigit() and int(tgt) in nodes else None)
+        if tid is None:
+            continue
+        cmds = relink_cmds(nodes, ports, nid, tid)
+        why = " (node.dont-reconnect: WirePlumber will not relink it)" if truthy(p.get("node.dont-reconnect")) else ""
+        msg = f"'{p.get('node.name')}' is not linked although its target '{nodes[tid].get('node.name')}' is present{why}"
+        if fix and cmds:
+            ok = all(run(c).returncode == 0 for c in cmds)
+            find("OK" if ok else "BREAK", "live", msg + (": RELINKED" if ok else ": relink FAILED"), " ; ".join(" ".join(c) for c in cmds))
+        else:
+            find("BREAK", "live", msg, ("audio-doctor --fix  (runs: " + " ; ".join(" ".join(c) for c in cmds) + ")") if cmds else "relink it in qpwgraph")
+
+    return findings, [short(f) for _, f in files]
+
+
+def main():
+    args = sys.argv[1:]
+    findings, files = audit(fix="--fix" in args)
+    order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
+    findings.sort(key=lambda f: order[f["severity"]])
+    if "--json" in args:
+        print(json.dumps({"files": files, "findings": findings}, indent=1)); return
+    print(f"config audit: {len(files)} drop-ins read")
+    for f in files:
+        print(f"  {f}")
+    if not findings:
+        print("no config traps found"); return
+    for f in findings:
+        print(f"  [{f['severity']:5}] {f['check']:9} {f['message']}" + (f"\n{'':19}fix: {f['fix']}" if f["fix"] else ""))
+    sys.exit(1 if any(f["severity"] == "BREAK" for f in findings) else 0)
+
+
+if __name__ == "__main__":
+    main()

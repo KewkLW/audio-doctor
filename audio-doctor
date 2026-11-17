@@ -15,22 +15,28 @@ Chain checked (in order):
                             sink and confirm it arrives at the hardware sink
   audio-doctor --app NAME   only streams whose app/media name matches NAME
   audio-doctor --secs 1.0   metering window (default 1.0 s)
+  audio-doctor --audit      config audit only (PipeWire/WirePlumber traps, see config-audit)
+  audio-doctor --fix        relink streams whose target is present but unlinked, then diagnose
+
+Every run also folds in the config audit (hop "config"): traps that will break
+audio later (dont-reconnect loopbacks, missing targets, unpinned pro-audio, drift).
 """
 import json, math, os, re, shutil, subprocess as sp, sys, tempfile, threading, time
 from array import array
 import importlib.util
 from importlib.machinery import SourceFileLoader
 
-def _load_whatis():
-    """whatis lives next to the real script (no .py suffix), so load it by path.
+def _load(name, modname):
+    """Sibling tools live next to the real script (no .py suffix), so load them by path.
     realpath: audio-doctor usually runs through the ~/.local/bin symlink."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "whatis")
-    loader = SourceFileLoader("whatis", path)
-    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("whatis", loader))
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+    loader = SourceFileLoader(modname, path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(modname, loader))
     loader.exec_module(mod)
-    sys.modules["whatis"] = mod
+    sys.modules[modname] = mod
     return mod
-whatis = _load_whatis()
+whatis = _load("whatis", "whatis")
+confaudit = _load("config-audit", "confaudit")
 
 SILENT_DB = -90.0
 ARGS = sys.argv[1:]
@@ -38,6 +44,8 @@ JSON = "--json" in ARGS
 TONE = "--tone" in ARGS
 SECS = float(ARGS[ARGS.index("--secs") + 1]) if "--secs" in ARGS else 1.0
 APP = ARGS[ARGS.index("--app") + 1].lower() if "--app" in ARGS else None
+AUDIT_ONLY = "--audit" in ARGS
+FIX = "--fix" in ARGS
 
 def run(cmd, timeout=6):
     try:
@@ -207,6 +215,13 @@ def rme_check(hw):
 # ------------------------------------------------------------------ main
 def main():
     t0 = time.time()
+    if AUDIT_ONLY:
+        sys.argv = [sys.argv[0]] + (["--json"] if JSON else []) + (["--fix"] if FIX else [])
+        return confaudit.main()
+    fixed = []
+    if FIX:  # relink first so the measured report shows the repaired graph
+        fixed = [f for f in confaudit.audit(fix=True)[0] if f["check"] == "live"]
+        time.sleep(0.5)
     svc = services()
     hw = hardware()
     nodes, links, dump = graph()
@@ -215,6 +230,8 @@ def main():
         ctx = whatis.Context(dump)
         wbox["ctx"], wbox["apps"] = ctx, whatis.survey_audio(ctx)
     wt = threading.Thread(target=_whatis); wt.start()
+    cbox = {}
+    ct = threading.Thread(target=lambda: cbox.update(f=confaudit.audit(dump)[0])); ct.start()
     defaults = nodes.pop("_defaults", {})
     def_sink = run(["pactl", "get-default-sink"]).strip() or defaults.get("default.audio.sink")
     sinks = {s["name"]: s for s in pactl_json("sinks")}
@@ -330,7 +347,7 @@ def main():
         v = sink_info[n]["volume_pct"]
         if v is not None and v <= 2: find("BREAK", "sink", f"sink '{s.get('description')}' volume is {v}%", f"pactl set-sink-volume {n} 50%")
         if n in hops and not hops[n]:
-            find("BREAK", "routing", f"virtual sink '{s.get('description')}' is not linked to any hardware sink", "check the loopback target (device unplugged or renamed?)")
+            find("BREAK", "routing", f"virtual sink '{s.get('description')}' is not linked to any hardware sink", "device off/unplugged/renamed? if it is back: audio-doctor --fix (relinks); see the config findings")
 
     # stream verdicts
     pw_since = ctx.since
@@ -375,6 +392,10 @@ def main():
         else: find("OK", "tone", "test tone reached the hardware sink: PipeWire path is good; if you still hear nothing, it's the device/cable/headphones")
 
     rt.join(); rme = rme_box.get("r")
+    ct.join()
+    have_live = {f["message"] for f in fixed}
+    findings.extend(fixed)
+    findings.extend(f for f in cbox.get("f", []) if f["message"] not in have_live)
 
     order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
     findings.sort(key=lambda f: order[f["severity"]])
