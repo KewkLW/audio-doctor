@@ -30,6 +30,20 @@ audio-doctor --audit      # config audit only (= `config-audit`)
 | dupes / legacy | same node.name in two files; WirePlumber 0.4 `*.lua.d` dirs | |
 Verify a new loopback flag set without restarting PipeWire: `pw-loopback` against a `pactl load-module module-null-sink`, then unload/reload the sink (present -> gone -> back, cold start, capture direction).
 
+## omarchy-audio-audit: baseline, first install, power checks
+`omarchy-audio-audit` (same repo, in ~/.local/bin) measures how fit the machine is for realtime audio. Run it on a first install (`--first-run`), before/after any tuning change, and when troubleshooting crackles or latency.
+```
+omarchy-audio-audit               # ~12 min: idle + synthetic stress; ONE sudo (ntfy) for cyclictest/rtla/turbostat/lspci
+omarchy-audio-audit --quick --no-root --loads idle   # ~1.5 min smoke test, no sudo
+omarchy-audio-audit --daw 60      # a DAW is connected: xruns at the CURRENT buffer, never changes it
+omarchy-audio-audit --disk-path /path/to/samples     # disk wake test on the sample library's drive
+```
+- Per load: latency probes (P/E split), buffer sweep (interface vs client xruns, valid only if the driver ran at that size), context (temp, throttling, top CPU).
+- **Power settings, always:** sleep/idle, USB autosuspend per interface + hubs + controller, governor/EPP/turbo, C-states, PCIe ASPM (per link with root), PCI runtime PM, NVIDIA, HDA, PipeWire suspend, NVMe APST, write-back, Wi-Fi, EEE, NMI watchdog, power tuners; verdict keep / session / measure / change. Plus a **disk wake test** (cold vs warm 4 KiB reads).
+- Safety: restores force-quantum/force-rate exactly; refuses the sweep while any DAW is connected (JACK **or** native PipeWire backend: a buffer change kills Bitwig's engine); skips it when routing is broken; never restarts PipeWire.
+- Output: `~/.local/state/omarchy-studio/audit/<time>/` (`audit.json`, `report.html`, `raw/`), `watch_seed` for the future watcher.
+- Helpers in `audit/`: `footprint NAME` / `footprint compare A B` (memory/CPU before vs after, e.g. DAW loaded), `quiet-park park|unpark|status` (freeze background stuff for a test), `quiet-report`, `boot-inventory OUT.html` (everything that starts at boot).
+
 ## whatis: which app is that process really?
 `whatis` (same repo, symlinked into ~/.local/bin) names the real app behind generic process names. audio-doctor imports it to label every stream owner and app.
 ```
@@ -67,6 +81,7 @@ Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-prot
 | ADI-2 volume <= -70 dB | knob turned down | tell the user; never raise volume yourself |
 | tone reaches hardware sink, still silent | device/cable/phones side | check `adi2 dump`, phones jack, cable |
 | stream plays to a non-default sink | per-app routing stuck | `pactl move-sink-input <idx> rme_phones` |
+| browser/system audio silent right after starting Bitwig | Bitwig (PipeWire backend) re-creates the RME nodes; old loopback flags don't relink | `audio-doctor --fix`; permanent once the new flags are live (PipeWire start) |
 
 ## Rules
 - Avoid restarting PipeWire while the user has apps open: it is what stales their audio. If you must, run `whatis --audio` first and tell the user which apps to reopen.
