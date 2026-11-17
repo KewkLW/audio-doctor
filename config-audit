@@ -274,7 +274,12 @@ def audit(dump=None, fix=False):
         mc = p.get("media.class") or ""
         if not tgt or not mc.startswith("Stream/") or nid in linked:
             continue
-        tid = by_name.get(tgt) or (int(tgt) if str(tgt).isdigit() and int(tgt) in nodes else None)
+        # target.object is a node.name or an object.serial (NOT an id); node.target is a name or an id
+        tid = by_name.get(tgt)
+        if tid is None and str(tgt).isdigit():
+            key = "object.serial" if p.get("target.object") else None
+            tid = next((i for i, q in nodes.items() if str(q.get("object.serial")) == str(tgt)), None) if key \
+                else (int(tgt) if int(tgt) in nodes else None)
         if tid is None:
             continue
         cmds = relink_cmds(nodes, ports, nid, tid)
