@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""whatis: say which real app a process is, when its process name hides it.
+
+  whatis PID|NAME     identify one pid, or every app matching NAME (comm, real name, window)
+  whatis --gui        every window on the desktop
+  whatis --audio      every window app plus every PipeWire client
+  add --json for machine-readable output
+
+Per app it reports the real name, the runtime (native / chromium-webapp / electron /
+wine-proton / appimage / flatpak / interpreter-script), the evidence used, window title,
+start time, launcher scope, whether it is a PipeWire client, whether it shows audio
+evidence, and `stale`: started before the current pipewire-pulse came up AND has no
+PipeWire client (it probably lost its audio connection in that restart).
+
+Read-only: it only reads /proc, `hyprctl clients -j`, `pw-dump`, `systemctl show` and
+.desktop / Steam manifest files. It never signals or touches a process or window.
+audio-doctor imports this file (SourceFileLoader, since it has no .py suffix).
+"""
+import glob, json, os, re, subprocess as sp, sys, time
+
+HZ = os.sysconf("SC_CLK_TCK")
+HOME = os.path.expanduser("~")
+
+# Env keys that may be read as evidence. Nothing else from environ is ever printed
+# (agent processes carry tokens in their env).
+ENV_KEYS = ("SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID", "STEAM_COMPAT_DATA_PATH", "WINEPREFIX",
+            "PROTONPATH", "APPIMAGE", "APPDIR", "ARGV0", "FLATPAK_ID", "SNAP_NAME", "CLAUDE_CODE_SESSION_ID")
+
+# Generic process names: when comm is one of these the real app is hidden behind it.
+GENERIC = re.compile(r"^(chromium|chrome|CrBrowserMain|electron|AppRun.*|wine.*|.*\.exe|python[\d.]*|node|java|"
+                     r"bwrap|srt-bwrap|pv-adverb|bash|sh|perl|ruby|lua|gjs|mono|dotnet|Main|MainThread|GeckoMain)$", re.I)
+
+# Known chromium/electron web-app hosts -> human names.
+WEBAPPS = {"discord.com": "Discord", "web.whatsapp.com": "WhatsApp", "app.slack.com": "Slack",
+           "open.spotify.com": "Spotify", "music.youtube.com": "YouTube Music", "www.youtube.com": "YouTube",
+           "youtube.com": "YouTube", "chatgpt.com": "ChatGPT", "claude.ai": "Claude", "web.telegram.org": "Telegram",
+           "app.zoom.us": "Zoom", "teams.microsoft.com": "Teams", "meet.google.com": "Google Meet",
+           "mail.google.com": "Gmail", "calendar.google.com": "Google Calendar", "x.com": "X", "github.com": "GitHub"}
+
+INTERPRETERS = re.compile(r"^(python[\d.]*|node|nodejs|bun|deno|perl|ruby|bash|sh|zsh|dash|lua[\d.]*|gjs|java|mono|dotnet|php)$")
+
+# Audio evidence in a process tree's memory maps. libasound alone is not enough
+# (Electron/Chromium link it without ever playing); a pulse/pipewire/jack client lib is.
+AUDIO_LIB = re.compile(r"/(libpulse\.so[^/\n]*|libpipewire-0\.3\.so[^/\n]*|libjack\.so[^/\n]*|libopenal\.so[^/\n]*|"
+                       r"libportaudio\.so[^/\n]*|winepulse\.(?:so|drv)|winealsa\.(?:so|drv)|libasound_module_pcm_pipewire\.so)$", re.M)
+
+
+# ------------------------------------------------------------------ small readers
+def _run(cmd, timeout=6):
+    try:
+        return sp.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+def _read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r", errors=None if binary else "replace") as f:
+            return f.read()
+    except (OSError, PermissionError):
+        return b"" if binary else ""
+
+def _btime():
+    for l in _read("/proc/stat").splitlines():
+        if l.startswith("btime "):
+            return int(l.split()[1])
+    return 0
+BTIME = _btime()
+
+class Proc:
+    """Lazy view of /proc/PID. Every read tolerates the process vanishing or being root-owned."""
+    def __init__(self, pid):
+        self.pid = int(pid)
+        self._c = {}
+    def _get(self, k, fn):
+        if k not in self._c: self._c[k] = fn()
+        return self._c[k]
+    @property
+    def alive(self): return os.path.isdir(f"/proc/{self.pid}")
+    @property
+    def comm(self): return self._get("comm", lambda: _read(f"/proc/{self.pid}/comm").strip())
+    @property
+    def argv(self):
+        raw = self._get("raw", lambda: _read(f"/proc/{self.pid}/cmdline", True))
+        parts = [p.decode(errors="replace") for p in raw.split(b"\0") if p]
+        return parts
+    @property
+    def cmdline(self):
+        # Chromium and Wine rewrite argv into one space-joined string: treat as text, use regexes.
+        return " ".join(self.argv)
+    @property
+    def exe(self):
+        def f():
+            try: return os.readlink(f"/proc/{self.pid}/exe")
+            except OSError: return ""
+        return self._get("exe", f)
+    @property
+    def stat(self):
+        def f():
+            s = _read(f"/proc/{self.pid}/stat")
+            if ")" not in s: return []
+            return s.rsplit(")", 1)[1].split()
+        return self._get("stat", f)
+    @property
+    def ppid(self):
+        st = self.stat
+        return int(st[1]) if len(st) > 1 else 0
+    @property
+    def start(self):
+        """Wall-clock start (unix seconds). btime + start ticks, same basis as `ps -o lstart`."""
+        st = self.stat
+        return BTIME + int(st[19]) / HZ if len(st) > 19 else None
+    @property
+    def cgroup(self):
+        return self._get("cg", lambda: (_read(f"/proc/{self.pid}/cgroup").strip().split("::", 1) + [""])[1].strip())
+    @property
+    def env(self):
+        def f():
+            raw = _read(f"/proc/{self.pid}/environ", True)
+            out = {}
+            for kv in raw.split(b"\0"):
+                k, _, v = kv.decode(errors="replace").partition("=")
+                if k in ENV_KEYS: out[k] = v
+            return out
+        return self._get("env", f)
+    @property
+    def maps_audio(self):
+        return self._get("maps", lambda: sorted(set(AUDIO_LIB.findall(_read(f"/proc/{self.pid}/maps")))))
+
+
+# ------------------------------------------------------------------ system snapshots
+def all_pids():
+    return [int(d) for d in os.listdir("/proc") if d.isdigit()]
+
+def children_map(pids=None):
+    kids = {}
+    for p in pids or all_pids():
+        st = _read(f"/proc/{p}/stat")
+        if ")" in st:
+            try: kids.setdefault(int(st.rsplit(")", 1)[1].split()[1]), []).append(p)
+            except (IndexError, ValueError): pass
+    return kids
+
+def descendants(pid, kids):
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        for c in kids.get(p, []):
+            out.append(c); todo.append(c)
+    return out
+
+def windows():
+    try: return json.loads(_run(["hyprctl", "clients", "-j"], 3) or "[]")
+    except json.JSONDecodeError: return []
+
+def pw_clients(dump=None):
+    """{pid: [application.name,...]} for every PipeWire Client. Uses application.process.id:
+    for pulse clients pipewire.sec.pid is pipewire-pulse itself."""
+    if dump is None:
+        try: dump = json.loads(_run(["pw-dump"], 8) or "[]")
+        except json.JSONDecodeError: dump = []
+    out = {}
+    for o in dump:
+        if not o.get("type", "").endswith("Client"): continue
+        props = (o.get("info") or {}).get("props") or {}
+        pid = props.get("application.process.id")
+        try: pid = int(pid)
+        except (TypeError, ValueError): continue
+        out.setdefault(pid, []).append(props.get("application.name") or props.get("application.process.binary") or "?")
+    return out
+
+def pipewire_since():
+    """Wall-clock time pipewire-pulse (else pipewire) last became active."""
+    for unit in ("pipewire-pulse", "pipewire"):
+        v = _run(["systemctl", "--user", "show", unit, "--timestamp=unix", "-p", "ActiveEnterTimestamp", "--value"], 3).strip()
+        if v.startswith("@") and v[1:].isdigit() and int(v[1:]) > 0:
+            return int(v[1:])
+    return None
+
+
+# ------------------------------------------------------------------ name sources
+_desktop_cache = None
+def desktop_index():
+    """Map lowercased keys (file id, StartupWMClass, Exec basename) -> Name from .desktop files."""
+    global _desktop_cache
+    if _desktop_cache is not None: return _desktop_cache
+    idx = {}
+    dirs = [os.path.join(HOME, ".local/share/applications"), "/usr/share/applications",
+            "/var/lib/flatpak/exports/share/applications", os.path.join(HOME, ".local/share/flatpak/exports/share/applications")]
+    for d in reversed(dirs):  # user dir last so it wins
+        for f in glob.glob(os.path.join(d, "*.desktop")):
+            name = wm = exe = None; in_entry = False
+            for l in _read(f).splitlines():
+                if l.startswith("["): in_entry = l.strip() == "[Desktop Entry]"; continue
+                if not in_entry: continue
+                if l.startswith("Name=") and name is None: name = l[5:].strip()
+                elif l.startswith("StartupWMClass="): wm = l[15:].strip()
+                elif l.startswith("Exec=") and exe is None: exe = l[5:].strip()
+            if not name: continue
+            fid = os.path.basename(f)[:-8]
+            idx[fid.lower()] = name
+            if wm: idx[wm.lower()] = name
+            if exe:
+                tok = exe.split()[0].strip('"')
+                idx.setdefault("exec:" + os.path.basename(tok).lower(), name)
+    _desktop_cache = idx
+    return idx
+
+def steam_app_name(appid):
+    if not str(appid).isdigit() or appid == "0": return None
+    libs = {os.path.join(HOME, ".local/share/Steam"), os.path.join(HOME, ".steam/steam")}
+    for vdf in glob.glob(os.path.join(HOME, ".local/share/Steam/steamapps/libraryfolders.vdf")):
+        libs.update(re.findall(r'"path"\s+"([^"]+)"', _read(vdf)))
+    for lib in libs:
+        m = re.search(r'"name"\s+"([^"]+)"', _read(os.path.join(lib, "steamapps", f"appmanifest_{appid}.acf")))
+        if m: return m.group(1)
+    return None
+
+def appdir_of(exe):
+    """Walk up from an exe to an AppImage AppDir (a directory holding AppRun + a .desktop)."""
+    d = os.path.dirname(exe)
+    for _ in range(6):
+        if os.path.exists(os.path.join(d, "AppRun")):
+            return d
+        if d in ("/", ""): break
+        d = os.path.dirname(d)
+    return None
+
+def desktop_name_in(d):
+    for f in glob.glob(os.path.join(d, "*.desktop")):
+        m = re.search(r"^Name=(.+)$", _read(f), re.M)
+        if m: return m.group(1).strip(), os.path.basename(f)
+    return None, None
+
+def scope_of(cg):
+    leaf = cg.rsplit("/", 1)[-1]
+    m = re.match(r"app-(?:(?P<via>Hyprland|gnome|flatpak|dbus|systemd)-)?(?P<app>.+?)(?:-(?P<id>[0-9a-f]{6,}|\d+))?\.scope$", leaf)
+    if m:
+        app = m.group("app").replace("\\x2d", "-")
+        return {"unit": leaf, "launcher": app, "via": m.group("via")}
+    if leaf.endswith((".scope", ".service")):
+        return {"unit": leaf, "launcher": re.sub(r"(-\d{8}-\d{6})?\.(scope|service)$", "", leaf), "via": "systemd-run"}
+    return {"unit": leaf, "launcher": None, "via": None}
+
+
+# ------------------------------------------------------------------ identification
+def top_of_app(p, cache):
+    """Walk up from a helper (chromium --type=..., electron renderer, wine child) to the app's
+    main process: stop at the first parent with a different exe family."""
+    cur = p
+    for _ in range(12):
+        par = cache(cur.ppid) if cur.ppid > 1 else None
+        if not par or not par.alive: break
+        same = par.exe and par.exe == cur.exe
+        wine_family = "wine" in cur.exe and "wine" in par.exe
+        if "--type=" in cur.cmdline and (same or wine_family):
+            cur = par; continue
+        if same and os.path.basename(cur.exe) not in ("bash", "sh", "python3"):
+            cur = par; continue
+        break
+    return cur
+
+def identify(pid, win=None, pwc=None, kids=None, pw_since=None, _cache=None):
+    """Return a dict describing what app `pid` really is. Never raises for a vanished pid."""
+    cache = _cache if _cache is not None else {}
+    def P(x):
+        if x not in cache: cache[x] = Proc(x)
+        return cache[x]
+    p = P(pid)
+    if not p.alive:
+        return {"pid": int(pid), "alive": False, "name": None}
+    kids = kids if kids is not None else children_map()
+    pwc = pwc if pwc is not None else pw_clients()
+    win = win or {}
+    cls, title = win.get("class") or "", win.get("title") or ""
+    comm, exe, cmd, env = p.comm, p.exe, p.cmdline, p.env
+    ev, name, runtime, extra = [], None, "native", {}
+    exe_base = os.path.basename(exe)
+    didx = desktop_index()
+
+    # ---- flatpak
+    fid = env.get("FLATPAK_ID") or (re.search(r"app-flatpak-([\w.]+?)-\d+\.scope", p.cgroup) or [None, None])[1]
+    # ---- wine / proton
+    winexe = re.search(r"([A-Za-z]:\\[^\0]*?\.exe|[A-Za-z]:/[^\0]*?\.exe)", cmd, re.I)
+    is_wine = "wine" in exe_base or "wine" in exe or bool(winexe and ("wine" in exe or not exe))
+    m_app = re.search(r"--app=(https?://([^/\s]+)[^\s]*)", cmd)
+
+    if fid:
+        runtime = "flatpak"; ev.append(f"flatpak id {fid}")
+        name = didx.get(fid.lower()) or fid.rsplit(".", 1)[-1]
+        extra["flatpak_id"] = fid
+    elif is_wine:
+        runtime = "wine-proton"
+        wexe = winexe.group(1) if winexe else cmd.split(" ")[0]
+        ev.append(f"exe {exe} (wine), argv {wexe}")
+        appid = env.get("SteamAppId") or env.get("SteamGameId")
+        sname = steam_app_name(appid) if appid else None
+        prefix = env.get("WINEPREFIX") or (os.path.join(env["STEAM_COMPAT_DATA_PATH"], "pfx") if env.get("STEAM_COMPAT_DATA_PATH") else None)
+        if not prefix:
+            prefix = os.path.join(HOME, ".wine"); ev.append("no WINEPREFIX in env -> default ~/.wine")
+        else:
+            ev.append(f"WINEPREFIX {prefix}")
+        tool = env.get("PROTONPATH") or (re.search(r"(/[^\0]*?/(?:GE-)?Proton[^/]*)", exe) or [None, None])[1]
+        extra.update(wine_exe=wexe, wine_prefix=prefix.rstrip("/"))
+        if tool: extra["proton"] = os.path.basename(tool.rstrip("/")); ev.append(f"proton {extra['proton']}")
+        if appid:
+            extra["steam_app_id"] = appid
+            ev.append(f"SteamAppId={appid}" + (f" -> {sname}" if sname else " (not a numeric Steam app id: umu/non-Steam launch)" if not appid.isdigit() else " (no appmanifest)"))
+        base = re.split(r"[\\/]", wexe)[-1]
+        base = re.sub(r"\.exe$", "", base, flags=re.I)
+        name = sname or (title if cls.startswith("steam_app_") and title else None) or base
+    elif m_app:
+        runtime = "chromium-webapp"; host = m_app.group(2)
+        name = WEBAPPS.get(host) or WEBAPPS.get(host.removeprefix("www.")) or host
+        ev.append(f"--app={m_app.group(1)}")
+        extra["webapp_url"] = m_app.group(1)
+    else:
+        appdir = env.get("APPDIR") or appdir_of(exe) if exe else None
+        exe_dir = os.path.dirname(exe)
+        if env.get("APPIMAGE") or exe.startswith("/tmp/.mount_") or comm.startswith("AppRun") or (appdir and appdir != exe_dir and glob.glob(os.path.join(appdir, "*.desktop"))):
+            runtime = "appimage"
+            appdir = appdir or appdir_of(exe) or exe_dir
+            dn, df = desktop_name_in(appdir) if appdir else (None, None)
+            name = dn or os.path.basename(exe)
+            src = env.get("APPIMAGE") or appdir
+            ev.append(f"AppImage {'file ' + env['APPIMAGE'] if env.get('APPIMAGE') else 'AppDir ' + appdir}" + (f", {df}" if df else ""))
+            extra["appimage"] = src
+        elif (os.path.exists(os.path.join(exe_dir, "resources", "app.asar")) or exe_base == "electron"
+              or re.search(r"electron", exe_base, re.I) or re.search(r"\S+/app\.asar", cmd)):
+            runtime = "electron"
+            asar = re.search(r"(\S+/app\.asar)", cmd)
+            ev.append("electron: " + (asar.group(1) if asar else os.path.join(exe_dir, "resources/app.asar")))
+            name = didx.get(cls.lower()) or didx.get("exec:" + exe_base.lower()) or (cls or os.path.basename(exe_dir)).split(".")[-1]
+        elif INTERPRETERS.match(exe_base.split(".")[0] if exe_base else comm) or INTERPRETERS.match(re.sub(r"[\d.]+$", "", exe_base)):
+            runtime = "interpreter-script"
+            script = next((a for a in p.argv[1:] if not a.startswith("-") and ("/" in a or "." in a)), None)
+            name = os.path.basename(script) if script else comm
+            ev.append(f"{exe_base} running {script or '(inline)'}")
+            if script: extra["script"] = script
+
+    webview = None
+    if runtime == "native":
+        maps = _read(f"/proc/{p.pid}/maps")
+        if "libwebkit2gtk" in maps or "libwebkitgtk" in maps:
+            webview = "WebKitGTK webview (Tauri/GTK web app)"; ev.append(webview)
+    if name is None:  # native: best human name from desktop files / window class / exe
+        for key in (cls.lower(), comm.lower(), "exec:" + exe_base.lower()):
+            if key and key in didx:
+                name = didx[key]; ev.append(f".desktop Name for '{key.removeprefix('exec:')}'"); break
+    if name is None and webview and title:
+        name = title; ev.append("name from window title (webview app, no .desktop)")
+    if name is None:
+        name = (cls.split(".")[-1] if cls and not GENERIC.match(cls) else None) or exe_base or comm
+    if win: ev.append(f"window class {cls!r}")
+    if env.get("CLAUDE_CODE_SESSION_ID"):
+        extra["agent_session"] = env["CLAUDE_CODE_SESSION_ID"]
+        ev.append(f"started from Claude session {env['CLAUDE_CODE_SESSION_ID']}")
+
+    # ---- PipeWire client: this pid or any descendant; for wine also siblings in the same prefix
+    group = [p.pid] + descendants(p.pid, kids)
+    if runtime == "wine-proton":
+        for q in kids.get(p.ppid, []):
+            if q not in group and "wine" in P(q).exe and P(q).env.get("WINEPREFIX", extra.get("wine_prefix")) == env.get("WINEPREFIX", extra.get("wine_prefix")):
+                group.append(q); group += descendants(q, kids)
+    client_pids = [q for q in group if q in pwc]
+    audio_libs = sorted({lib for q in group for lib in P(q).maps_audio})
+
+    start = p.start
+    stale = bool(pw_since and start and start < pw_since and not client_pids)
+    sc = scope_of(p.cgroup)
+    scope_note = scope_explain(sc, name, cls, exe, comm, p.cgroup)
+    real = name
+    return {
+        "pid": p.pid, "alive": True, "comm": comm, "name": real,
+        "generic_comm": bool(GENERIC.match(comm)) or (real or "").lower() not in comm.lower() and comm.lower() not in (real or "").lower(),
+        "runtime": runtime, "evidence": ev, "exe": exe, "window_title": title or None, "window_class": cls or None,
+        "workspace": (win.get("workspace") or {}).get("name"),
+        "start": start, "start_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start)) if start else None,
+        "scope": sc["unit"], "launcher": sc["launcher"], "launched_via": sc["via"], "scope_note": scope_note,
+        "pw_client": bool(client_pids), "pw_client_pids": client_pids,
+        "audio_libs": audio_libs, "audio_capable": bool(audio_libs) or bool(client_pids),
+        "stale": stale, **extra,
+        "label": label_for(real, runtime),
+    }
+
+# Scopes created by a launcher helper rather than by the app itself.
+LAUNCH_HELPERS = {"gtk-launch", "uwsm-app", "systemd-run", "dbus", "xdg-open", "omarchy-launch-webapp", "omarchy-launch"}
+TERMINAL_SCOPES = {"xdg-terminal-exec", "foot", "footclient", "alacritty", "kitty", "ghostty", "com.mitchellh.ghostty"}
+TERMINALS = {"foot", "footclient", "alacritty", "kitty", "ghostty", "org.omarchy.agent"}
+
+def _tok(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+def scope_explain(sc, name, cls, exe, comm, cg):
+    """Say how the launcher scope relates to the app, only when it is not the app's own scope."""
+    l = sc.get("launcher")
+    if not l: return None
+    base = _tok(l.split(".")[-1])
+    hay = " ".join(_tok(x) for x in (name, cls, exe, comm))
+    if base and base in hay: return None
+    if l in LAUNCH_HELPERS or l.startswith("omarchy-launch"):
+        return f"started via {l}"
+    if l in TERMINAL_SCOPES:
+        if comm in TERMINALS or (cls or "").lower() in TERMINALS: return None
+        return f"started from a shell inside terminal scope {sc['unit']}"
+    if sc.get("via") == "systemd-run":
+        return f"own systemd-run scope {sc['unit']}"
+    return f"started by {l}: it inherited {l}'s launch scope, it is not part of {l}"
+
+RT_TAG = {"chromium-webapp": "web app", "wine-proton": "wine", "appimage": "AppImage", "flatpak": "flatpak",
+          "electron": "electron", "interpreter-script": "script"}
+def label_for(name, runtime):
+    t = RT_TAG.get(runtime)
+    return f"{name} ({t})" if t else name
+
+
+# ------------------------------------------------------------------ surveys
+class Context:
+    """One snapshot shared by many identify() calls (one pw-dump, one hyprctl, one /proc walk)."""
+    def __init__(self, dump=None):
+        self.wins = windows()
+        self.win_by_pid = {}
+        for w in self.wins:
+            self.win_by_pid.setdefault(w.get("pid"), w)
+        self.pwc = pw_clients(dump)
+        self.kids = children_map()
+        self.since = pipewire_since()
+        self.cache = {}
+    def ident(self, pid):
+        return identify(pid, self.win_by_pid.get(int(pid)), self.pwc, self.kids, self.since, self.cache)
+    def owner(self, pid):
+        """Label a stream/client pid by its app's main process (helper -> app)."""
+        def P(x):
+            if x not in self.cache: self.cache[x] = Proc(x)
+            return self.cache[x]
+        p = P(int(pid))
+        if not p.alive: return None
+        # nearest ancestor (or self) that owns a window wins: that is the app the user sees
+        cur, hops = p, 0
+        while cur and cur.pid > 1 and hops < 15:
+            if cur.pid in self.win_by_pid: return self.ident(cur.pid)
+            cur = P(cur.ppid) if cur.ppid > 1 else None; hops += 1
+        return self.ident(top_of_app(p, P).pid)
+
+SYSTEM_CLIENTS = re.compile(r"^(pipewire|wireplumber|pw-dump|pw-record|pw-cat|pw-play|pw-link|pactl|xdg-desktop-por.*|pipewire-pulse)$")
+
+def survey_gui(ctx=None):
+    ctx = ctx or Context()
+    seen, out = set(), []
+    for w in ctx.wins:
+        pid = w.get("pid")
+        if not pid or pid in seen or pid <= 0: continue
+        seen.add(pid); out.append(ctx.ident(pid))
+    return out
+
+def survey_audio(ctx=None):
+    """Every GUI window app plus every PipeWire client (system daemons excluded), one row per app."""
+    ctx = ctx or Context()
+    rows = {r["pid"]: r for r in survey_gui(ctx)}
+    for pid in ctx.pwc:
+        if SYSTEM_CLIENTS.match(Proc(pid).comm or ""): continue
+        r = ctx.owner(pid)
+        if r and r["pid"] not in rows: rows[r["pid"]] = r
+    return sorted(rows.values(), key=lambda r: (r["workspace"] or "~", r["start"] or 0))
+
+def find_by_name(q, ctx=None):
+    ctx = ctx or Context()
+    ql = q.lower(); hits = {}
+    for w in ctx.wins:
+        if ql in (w.get("class") or "").lower() or ql in (w.get("title") or "").lower():
+            hits[w["pid"]] = ctx.ident(w["pid"])
+    for pid in all_pids():
+        c = Proc(pid).comm.lower()
+        if ql in c:
+            p = Proc(pid)
+            top = top_of_app(p, lambda x: Proc(x))
+            if top.pid not in hits: hits[top.pid] = ctx.ident(top.pid)
+    for r in survey_gui(ctx):
+        if ql in (r["name"] or "").lower(): hits.setdefault(r["pid"], r)
+    return list(hits.values())
+
+
+# ------------------------------------------------------------------ CLI
+def fmt(r, verbose=True):
+    if not r.get("alive"): return f"{r['pid']}: no such process"
+    flags = []
+    if r["pw_client"]: flags.append("pipewire-client")
+    elif r["audio_capable"]: flags.append("NO pipewire client")
+    if r["stale"]: flags.append("STALE" if r["audio_capable"] else "stale(no audio evidence)")
+    head = f"{r['pid']:>8}  {r['label']}  [{r['runtime']}]  comm={r['comm']!r}" + (f"  {' '.join(flags)}" if flags else "")
+    if not verbose: return head
+    lines = [head]
+    if r["window_title"]: lines.append(f"          window: {r['window_title'][:90]!s}  (ws {r['workspace']})")
+    lines.append(f"          started {r['start_str']}  scope {r['scope']}")
+    if r["scope_note"]: lines.append(f"          note: {r['scope_note']}")
+    for k in ("wine_prefix", "proton", "steam_app_id", "appimage", "webapp_url", "script", "flatpak_id", "agent_session"):
+        if r.get(k): lines.append(f"          {k}: {r[k]}")
+    lines.append("          evidence: " + "; ".join(r["evidence"]))
+    if r["audio_libs"]: lines.append("          audio libs: " + ", ".join(r["audio_libs"]))
+    return "\n".join(lines)
+
+def main(argv):
+    js = "--json" in argv
+    args = [a for a in argv if a != "--json"]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip()); return 0
+    ctx = Context()
+    if args[0] == "--gui": rows = survey_gui(ctx)
+    elif args[0] == "--audio": rows = survey_audio(ctx)
+    elif args[0].isdigit(): rows = [ctx.ident(int(args[0]))]
+    else: rows = find_by_name(args[0], ctx)
+    if js:
+        print(json.dumps(rows, indent=1, default=str)); return 0
+    if ctx.since:
+        print(f"pipewire-pulse up since {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ctx.since))}")
+    for r in rows: print(fmt(r))
+    if not rows: print("no match"); return 1
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

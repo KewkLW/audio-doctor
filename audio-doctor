@@ -18,6 +18,19 @@ Chain checked (in order):
 """
 import json, math, os, re, shutil, subprocess as sp, sys, tempfile, threading, time
 from array import array
+import importlib.util
+from importlib.machinery import SourceFileLoader
+
+def _load_whatis():
+    """whatis lives next to the real script (no .py suffix), so load it by path.
+    realpath: audio-doctor usually runs through the ~/.local/bin symlink."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "whatis")
+    loader = SourceFileLoader("whatis", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("whatis", loader))
+    loader.exec_module(mod)
+    sys.modules["whatis"] = mod
+    return mod
+whatis = _load_whatis()
 
 SILENT_DB = -90.0
 ARGS = sys.argv[1:]
@@ -80,7 +93,8 @@ def vol_pct(v):
         return None
 
 def graph():
-    dump = json.loads(run(["pw-dump"], timeout=8) or "[]")
+    try: dump = json.loads(run(["pw-dump"], timeout=8) or "[]")
+    except json.JSONDecodeError: dump = []
     nodes, ports, links = {}, {}, []
     for o in dump:
         t, info = o.get("type", ""), o.get("info") or {}
@@ -93,7 +107,7 @@ def graph():
                 if m.get("key") in ("default.audio.sink", "default.audio.source"):
                     val = m.get("value")
                     nodes.setdefault("_defaults", {})[m["key"]] = val.get("name") if isinstance(val, dict) else val
-    return nodes, links
+    return nodes, links, dump
 
 def downstream(node_id, links):
     return sorted({l["in_node"] for l in links if l["out_node"] == node_id})
@@ -184,22 +198,23 @@ def rme_check(hw):
         find("BREAK", "device", f"ADI-2 output 1/2 source is '{src}', not USB", "adi2 set line.source auto")
     return out
 
-# ------------------------------------------------------------------ process ages
-def proc_start_mono_us(pid):
-    try:
-        f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
-        return int(int(f[19]) / os.sysconf("SC_CLK_TCK") * 1e6)
-    except Exception:
-        return None
-
-AUDIO_APPS = re.compile(r"firefox|chromium|chrome|brave|spotify|mpv|vlc|discord|Ableton|obs", re.I)
+# ------------------------------------------------------------------ apps (via whatis)
+# Every GUI window app plus every PipeWire client, labelled with its real name
+# (chromium --app=discord.com -> "Discord (web app)", CrBrowserMain -> "Battle.net (wine)").
+# Staleness compares wall clocks (process start vs pipewire-pulse ActiveEnterTimestamp),
+# which stays right across suspend, unlike the monotonic-vs-boottime compare it replaces.
 
 # ------------------------------------------------------------------ main
 def main():
     t0 = time.time()
     svc = services()
     hw = hardware()
-    nodes, links = graph()
+    nodes, links, dump = graph()
+    wbox = {}
+    def _whatis():
+        ctx = whatis.Context(dump)
+        wbox["ctx"], wbox["apps"] = ctx, whatis.survey_audio(ctx)
+    wt = threading.Thread(target=_whatis); wt.start()
     defaults = nodes.pop("_defaults", {})
     def_sink = run(["pactl", "get-default-sink"]).strip() or defaults.get("default.audio.sink")
     sinks = {s["name"]: s for s in pactl_json("sinks")}
@@ -270,8 +285,13 @@ def main():
     if tone_proc:
         tone_proc.terminate()
 
+    wt.join()
+    ctx, apps = wbox["ctx"], wbox["apps"]
     for s in streams:
         s["level"] = levels.get("stream:%d" % s["node"])
+        own = ctx.owner(int(s["pid"])) if str(s.get("pid") or "").isdigit() else None
+        s["owner"] = {k: own[k] for k in ("pid", "name", "label", "runtime")} if own else None
+        s["label"] = own["label"] if own else s["app"]
     sink_info = {}
     for n in want_sinks:
         if n not in sinks: continue
@@ -286,17 +306,17 @@ def main():
             find("BREAK", "routing", f"virtual sink '{s.get('description')}' is not linked to any hardware sink", "check the loopback target (device unplugged or renamed?)")
 
     # stream verdicts
-    pw_start = svc.get("pipewire-pulse", {}).get("since_mono_us") or svc.get("pipewire", {}).get("since_mono_us")
+    pw_since = ctx.since
     for s in streams:
-        tag = f"{s['app']} [{s['media'][:40]}]"
+        tag = f"{s['label']} [{s['media'][:40]}]"
         if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
         elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
         if not s["linked_to"]: find("BREAK", "routing", f"{tag} is not linked to any sink")
         elif s["sink"] and s["sink"] != def_sink: find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
         if s["corked"]: find("INFO", "stream", f"{tag} is paused (corked) by the app")
         elif silent(s["level"]):
-            st = proc_start_mono_us(s["pid"]) if s["pid"] else None
-            if st and pw_start and st < pw_start:
+            st = whatis.Proc(int(s["pid"])).start if str(s.get("pid") or "").isdigit() else None
+            if st and pw_since and st < pw_since:
                 find("BREAK", "app", f"{tag} is connected but sending silence, and the app started BEFORE the last PipeWire restart: its audio engine is stale",
                      "restart the app (browser: full quit + reopen)")
             else:
@@ -309,26 +329,15 @@ def main():
                 if silent(sink_info.get(hwn, {}).get("level")):
                     find("BREAK", "routing", f"signal reaches '{s['sink']}' but not hardware sink '{hwn}'", "check loopback links in qpwgraph")
 
-    # audio apps running with no stream at all
-    stream_pids = {str(s["pid"]) for s in streams}
-    seen = set()
-    for line in run(["ps", "-eo", "pid=,stat=,comm="]).splitlines():
-        pid, stat, comm = line.strip().split(None, 2)
-        if stat.startswith("Z") or "crashpad" in comm or "helper" in comm: continue
-        if AUDIO_APPS.search(comm) and comm not in seen:
-            seen.add(comm)
-            try:
-                m = re.search(r"--app=https?://([^/\s\0]+)", open(f"/proc/{pid}/cmdline").read())
-                app_url = m.group(1) if m else None
-            except OSError:
-                app_url = None
-            label = f"{comm} web app ({app_url})" if app_url else comm
-            if pid not in stream_pids and not any(comm.lower() in (s["app"] or "").lower() for s in streams):
-                st = proc_start_mono_us(pid)
-                stale = st and pw_start and st < pw_start
-                find("WARN" if stale else "INFO", "app",
-                     f"{label} is running but has NO audio stream" + (" and started BEFORE the last PipeWire restart (stale audio engine likely)" if stale else " (nothing playing?)"),
-                     "restart it" if stale else "start playback; if no stream appears, restart the app")
+    # apps: stale ones (opened before the PipeWire restart, no PipeWire client, audio evidence) in ONE line
+    stream_owners = {s["owner"]["pid"] for s in streams if s.get("owner")}
+    stale = [a for a in apps if a["stale"] and a["audio_capable"] and a["pid"] not in stream_owners]
+    if stale:
+        when = time.strftime("%H:%M", time.localtime(pw_since)) if pw_since else "?"
+        find("WARN", "app", f"opened before the PipeWire restart ({when}), no audio connection: " + ", ".join(a["label"] for a in stale),
+             "fully quit + reopen each one that should make sound (the user does it; never kill their daily browser)")
+    for a in apps:
+        a["has_stream"] = a["pid"] in stream_owners
 
     # tone test
     if TONE:
@@ -343,7 +352,7 @@ def main():
     order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
     findings.sort(key=lambda f: order[f["severity"]])
     report = {"took_s": round(time.time() - t0, 1), "default_sink": def_sink, "services": svc, "hardware": hw,
-              "sinks": sink_info, "streams": streams, "rme": rme, "findings": findings}
+              "sinks": sink_info, "streams": streams, "apps": apps, "rme": rme, "findings": findings}
     if JSON:
         print(json.dumps(report, indent=1, default=str)); return
     breaks = [f for f in findings if f["severity"] == "BREAK"]
@@ -359,8 +368,13 @@ def main():
               + (f"\n      -> feeds {', '.join(s['feeds_hardware'])}" if s["feeds_hardware"] else ""))
     print("\napp streams (measured):")
     for s in streams:
-        print(f"  {s['app'][:14]:14} {s['media'][:34]:34} -> {str(s['sink'])[:30]:30} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}{' PAUSED' if s['corked'] else ''}  level {fmt_db(s['level'])}")
+        print(f"  {s['label'][:22]:22} {s['media'][:30]:30} -> {str(s['sink'])[:30]:30} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}{' PAUSED' if s['corked'] else ''}  level {fmt_db(s['level'])}")
     if not streams: print("  (none)")
+    shown = [a for a in apps if a["audio_capable"] or a["pw_client"]]
+    print(f"\napps that can make sound (whatis; {len(apps) - len(shown)} other windows without audio evidence not shown):")
+    for a in shown:
+        state = "STREAMING" if a["has_stream"] else "pipewire client" if a["pw_client"] else "NO pipewire client"
+        print(f"  {a['label'][:30]:30} {a['runtime']:16} pid {a['pid']:<8} started {a['start_str'][5:16] if a['start_str'] else '?':11} {state}{'  STALE' if a['stale'] else ''}")
     if rme:
         st = rme["status"]
         print(f"\nRME ADI-2: mode {rme['basic_mode']}, knob/line vol {rme['line']['volume']} dB, mute {rme['line']['mute']}, source {rme['line']['source']}, "

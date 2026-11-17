@@ -14,6 +14,24 @@ audio-doctor --tone       # ALSO plays a quiet -30 dBFS 440 Hz tone into the def
 audio-doctor --json       # for scripting
 ```
 
+## whatis: which app is that process really?
+`whatis` (same repo, symlinked into ~/.local/bin) names the real app behind generic process names. audio-doctor imports it to label every stream owner and app.
+```
+whatis 698290        # one pid      -> Battle.net (wine), prefix, Proton, SteamAppId
+whatis discord       # by comm / real name / window class or title
+whatis --gui         # every window
+whatis --audio       # every window app + every PipeWire client
+whatis --json ...    # for scripting
+```
+Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-proton (WINEPREFIX / STEAM_COMPAT_DATA_PATH / default ~/.wine, PROTONPATH, SteamAppId -> appmanifest), appimage (APPIMAGE env, or the AppRun + .desktop AppDir layout when env was reset), flatpak, interpreter-script. Tauri/WebKitGTK apps show as native with a "WebKitGTK webview" evidence line, named from the window title.
+- `launcher scope` is only where the app was started from, never the app's boundary: an app opened from a URI handler sits in the browser's old scope, an installer started by an agent sits in that agent's terminal scope. The `note:` line says which.
+- `agent_session`: the CLAUDE_CODE_SESSION_ID in the process env, i.e. the Claude session that launched it. Read that session's JSONL under ~/.claude/projects/.
+- `pipewire client`: this pid, a descendant, or (for Wine) a sibling in the same prefix holds a PipeWire Client (matched on `application.process.id`; `pipewire.sec.pid` is pipewire-pulse for pulse clients).
+- `audio evidence`: libpulse / libpipewire / libjack / libopenal / libportaudio / winepulse / winealsa mapped anywhere in the process tree. libasound alone does NOT count (Electron links it without playing).
+- `stale` = started before pipewire-pulse's ActiveEnterTimestamp (wall clock) AND no PipeWire client. audio-doctor only reports stale apps that also have audio evidence, as one line:
+  `opened before the PipeWire restart (17:02), no audio connection: Discord (web app), Battle.net (wine)`.
+  Terminals and similar stale-but-silent windows are left out.
+
 ## Reading it
 - Severity: BREAK (audio stops here) > WARN > INFO. The first BREAK is the answer.
 - `level` is MEASURED peak, not a setting. SILENT = below -90 dBFS.
@@ -23,7 +41,7 @@ audio-doctor --json       # for scripting
 | Symptom in report | Cause | Fix |
 |---|---|---|
 | stream connected but SILENT + "started BEFORE the last PipeWire restart" | app's audio engine went stale when PipeWire restarted (2026-11-16 YT incident) | The user fully quits + reopens the app. Never kill the user's daily browser yourself |
-| app running, NO audio stream, stale | same | same |
+| "opened before the PipeWire restart ..., no audio connection: X, Y" | same: those apps lost their PipeWire connection in the restart | The user fully quits + reopens each one they want sound from |
 | sink MUTED / volume <=2% | mixer | `pactl set-sink-mute <sink> 0` |
 | virtual sink not linked to any hardware sink | RME unplugged/renamed, loopback target gone | replug; check `~/.config/pipewire/pipewire.conf.d/50-rme-adi2-stereo.conf` target.object; `systemctl --user restart pipewire` (warn: stales open apps!) |
 | signal at sink but not at hardware sink | loopback links broken | `pw-link rme_phones.out:output_AUX0 <hw>:playback_AUX0` (and AUX1) |
@@ -33,7 +51,7 @@ audio-doctor --json       # for scripting
 | stream plays to a non-default sink | per-app routing stuck | `pactl move-sink-input <idx> rme_phones` |
 
 ## Rules
-- Avoid restarting PipeWire while the user has apps open: it is what stales their audio. If you must, tell him which apps to reopen.
+- Avoid restarting PipeWire while the user has apps open: it is what stales their audio. If you must, run `whatis --audio` first and tell the user which apps to reopen.
 - Never raise device or sink volume without asking (ears, speakers).
 - GUI view: `qpwgraph` (launch, then move silently to his workspace with
   `hyprctl dispatch 'hl.dsp.window.move({ workspace = N, follow = false, window = "pid:PID" })'`).
