@@ -23,6 +23,13 @@ audio-doctor before and after, a JSON file and an HTML report.
   omarchy-audio-audit --first-run     write to the 'first-run' slot once (skips if it exists)
   omarchy-audio-audit --sudo keyring  unattended: sudo password from the keyring instead of ntfy
   omarchy-audio-audit --label NAME    tag the result dir
+  omarchy-audio-audit --no-disk       skip the NVMe cold-read (disk wake) test
+  omarchy-audio-audit --disk-path DIR where the disk wake probe file lives (default: the results folder;
+                                      point it at your sample library's drive)
+Power settings (read-only, always): sleep/idle, USB autosuspend per interface + its hubs and controller,
+governor/EPP/turbo, C-states, PCIe ASPM (policy + per-link via root lspci), PCI runtime PM, NVIDIA power
+management, HDA power save, PipeWire suspend, NVMe APST, write-back, Wi-Fi power save, Ethernet EEE,
+NMI watchdog, power tuners. Each gets a verdict: keep / session (switch in session mode) / measure / change.
 
 Safety: restores clock.force-quantum and clock.force-rate to exactly what it found, on every
 exit path; refuses the buffer sweep while a JACK client (DAW) is connected (a size change kills
@@ -65,6 +72,13 @@ def root_helper(outdir, rtla, user):
             continue
         if cmd[0] == "quit":
             break
+        if cmd[0] == "lspci":
+            r = sp.run(["lspci", "-vvv"], capture_output=True, text=True, timeout=30)
+            os.makedirs(os.path.join(outdir, "raw"), exist_ok=True)
+            open(os.path.join(outdir, "raw", "lspci-vvv.txt"), "w").write(r.stdout)
+            sp.run(["chown", "-R", f"{user}:{user}", outdir])
+            print("DONE lspci", flush=True)
+            continue
         if cmd[0] != "probe":
             continue
         phase, ct, tl = cmd[1], int(cmd[2]), int(cmd[3])
@@ -242,6 +256,161 @@ def usb_audio_power():
     return out
 
 
+# ====================================================================== power settings (read-only)
+def _conf_values(patterns, keys):
+    out = {}
+    for pat in patterns:
+        for f in sorted(glob.glob(pat)):
+            for l in rd(f).splitlines():
+                l = l.strip()
+                if l.startswith("#") or "=" not in l: continue
+                k, v = (x.strip() for x in l.split("=", 1))
+                if k in keys: out[k] = v
+    return out
+
+
+def _usb_audio_devices():
+    devs = []
+    for d in glob.glob("/sys/bus/usb/devices/*:*"):
+        if rd(f"{d}/bInterfaceClass") == "01":
+            dev = os.path.realpath(d.rsplit("/", 1)[0] + "/" + os.path.basename(d).split(":")[0])
+            if dev not in devs: devs.append(dev)
+    return devs
+
+
+def power_settings(dump, chain):
+    """Every power-saving feature that can touch audio, current value + verdict (keep / session / measure / change).
+    Windows lists say 'disable all power saving'; here each one is judged on what it is set to."""
+    items = []
+    def add(area, name, current, verdict, why):
+        items.append({"area": area, "name": name, "current": str(current), "verdict": verdict, "why": why})
+    # sleep / idle
+    logind = _conf_values(["/usr/lib/systemd/logind.conf.d/*.conf", "/etc/systemd/logind.conf", "/etc/systemd/logind.conf.d/*.conf"],
+                          ("IdleAction", "IdleActionSec", "HandlePowerKey", "HandleLidSwitch"))
+    try: idle = json.load(open(os.path.expanduser("~/.config/omarchy/shell.json"))).get("idle", {})
+    except Exception: idle = {}
+    ia = logind.get("IdleAction", "ignore")
+    auto = ia not in ("ignore", "lock") or any(k in ("suspend", "sleep", "hibernate") for k in idle)
+    add("Sleep", "Automatic sleep", f"logind IdleAction={ia}; Omarchy idle {idle or 'defaults'}", "change" if auto else "keep",
+        "Something suspends the machine when idle: an unattended take or render would stop." if auto else "Nothing suspends the machine on its own.")
+    add("Sleep", "Hibernate", "configured (resume=)" if "resume=" in rd("/proc/cmdline") else "not configured", "keep", "Only when chosen by hand.")
+    m = re.search(r"\[(\w+)\]", rd("/sys/power/mem_sleep"))
+    add("Sleep", "Sleep type", m[1] if m else "?", "keep", "deep = real S3. After any sleep, USB devices re-plug: routing must relink (config-audit checks).")
+    add("Idle", "Screensaver", f"after {idle.get('screensaver')} s" if idle.get("screensaver") else "Omarchy default (150 s)", "session",
+        "The audio-reactive screensaver adds GPU/CPU load during an unattended take; pause it in session mode.")
+    # USB, per audio interface
+    add("USB", "USB autosuspend, global delay", rd("/sys/module/usbcore/parameters/autosuspend") + " s", "keep", "Applies only to devices set to 'auto'.")
+    for dev in _usb_audio_devices():
+        name = rd(f"{dev}/product", os.path.basename(dev)); ctl = rd(f"{dev}/power/control")
+        add("USB", f"{name}: USB power", f"control={ctl}, status={rd(dev + '/power/runtime_status')}", "keep" if ctl == "on" else "change",
+            "Never suspends." if ctl == "on" else "Can autosuspend: pin power/control=on with a udev rule.")
+        hubs, p = [], os.path.dirname(dev)
+        while re.match(r"^\d+-[\d.]+$", os.path.basename(p)):
+            hubs.append(f"{rd(p + '/product', os.path.basename(p))} ({rd(p + '/power/control')})"); p = os.path.dirname(p)
+        add("USB", f"{name}: hubs in between", ", ".join(hubs) or "none (straight into a root port)", "measure" if hubs else "keep",
+            "Hubs add a hop and share bandwidth; a hub only sleeps when nothing below it is busy." if hubs else "Best case.")
+        pcis = [x for x in dev.split("/") if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d$", x)]
+        if pcis:
+            c = f"/sys/bus/pci/devices/{pcis[-1]}"
+            add("PCI", f"{name}: its USB controller {pcis[-1]}", f"runtime PM {rd(c + '/power/control')}, {rd(c + '/power/runtime_status')}", "keep",
+                "Cannot sleep while the interface is in use.")
+    # CPU
+    gov = sorted({rd(f) for f in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")})
+    epp = sorted({rd(f) for f in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference")})
+    prof = run(["powerprofilesctl", "get"]).stdout.strip() if shutil.which("powerprofilesctl") else ""
+    fast = "performance" in epp or prof == "performance" or "performance" in gov
+    add("CPU", "Governor / EPP / power profile", f"driver {rd('/sys/devices/system/cpu/cpufreq/policy0/scaling_driver')}, governor {gov}, EPP {epp}, profile {prof or '?'}",
+        "keep" if fast else "change", "Clocks up immediately." if fast else "Power-saving bias: clocks ramp slowly under bursty audio load. Use the performance profile.")
+    nt = rd("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    add("CPU", "Turbo", "off" if nt == "1" else "on", "keep", "Heat, not turbo, is what limits a hot CPU; watch throttling in the context rows.")
+    cs = [f"{rd(s + '/name')} {rd(s + '/latency')} µs{' (disabled)' if rd(s + '/disable') == '1' else ''}" for s in sorted(glob.glob("/sys/devices/system/cpu/cpu0/cpuidle/state*"))]
+    add("CPU", "CPU sleep states (C-states)", ", ".join(cs) + f"; cmdline limits: {' '.join(re.findall(r'(?:intel_idle|processor)\.\S+|idle=\S+', rd('/proc/cmdline'))) or 'none'}", "session",
+        "Hold them off (cpu_dma_latency=0) during sessions and compare with the latency probes; permanently off mostly adds heat.")
+    # PCIe
+    m = re.search(r"\[(\w+)\]", rd("/sys/module/pcie_aspm/parameters/policy"))
+    add("PCI", "PCIe link power (ASPM) policy", m[1] if m else "?", "measure", "Per-link states are in the ASPM table (root). Suspect if rtla names a PCIe device.")
+    ctl = [rd(f) for f in glob.glob("/sys/bus/pci/devices/*/power/control")]
+    add("PCI", "PCI runtime power management", f"{ctl.count('auto')} devices auto, {ctl.count('on')} on", "keep", "Busy devices don't sleep; see the controller row above.")
+    # GPU
+    if os.path.exists("/proc/driver/nvidia/params"):
+        dpm = re.search(r"DynamicPowerManagement: (\d+)", rd("/proc/driver/nvidia/params"))
+        q = run(["nvidia-smi", "--query-gpu=pstate,persistence_mode,clocks.gr", "--format=csv,noheader"]).stdout.strip()
+        add("GPU", "NVIDIA power management", f"DynamicPowerManagement={dpm[1] if dpm else '?'}; now {q}", "measure",
+            "GPU power-state changes are a known latency spike. Test: latency probes while the GPU ramps, then with persistence + locked clocks.")
+    # audio
+    add("Audio", "Onboard HDA codec power save", f"{rd('/sys/module/snd_hda_intel/parameters/power_save', 'n/a')} s", "keep",
+        "Pops after silence on onboard/HDMI audio only. Set 0 if that is the interface in use.")
+    card = (chain or {}).get("card") or ""
+    st = sorted({str((o.get("info") or {}).get("props", {}).get("session.suspend-timeout-seconds", "default 5"))
+                 for o in dump if o.get("type", "").endswith("Node") and card and card in (o.get("info") or {}).get("props", {}).get("node.name", "")})
+    if not st:
+        add("Audio", "PipeWire suspend of the interface", "interface not found (routing broken?)", "measure", "Re-run after audio-doctor --fix.")
+    else:
+        add("Audio", "PipeWire suspend of the interface", ", ".join(st), "keep" if st == ["0"] else "change",
+            "Never suspends." if st == ["0"] else "The interface sleeps when idle: pop / relock on the next sound. WirePlumber rule session.suspend-timeout-seconds = 0.")
+    # disk
+    apst = rd("/sys/module/nvme_core/parameters/default_ps_max_latency_us")
+    if apst:
+        add("Disk", "NVMe power states (APST)", f"allows up to {int(apst) / 1000:g} ms wake latency", "measure",
+            "Matters when a DAW streams samples from disk; see the disk wake test. Cap it lower if cold reads are slow.")
+    add("Disk", "Write-back flushing", f"dirty {rd('/proc/sys/vm/dirty_background_bytes')}/{rd('/proc/sys/vm/dirty_bytes')} bytes, every {int(rd('/proc/sys/vm/dirty_writeback_centisecs', '0') or 0) / 100:g} s", "keep",
+        "Bounded write bursts are good for recording.")
+    # network
+    for i in sorted(os.listdir("/sys/class/net")):
+        if os.path.isdir(f"/sys/class/net/{i}/wireless"):
+            up = rd(f"/sys/class/net/{i}/operstate") == "up"
+            ps = run(["iw", "dev", i, "get", "power_save"]).stdout.strip() if shutil.which("iw") else "?"
+            add("Network", f"Wi-Fi power save ({i})", f"{ps}, link {'up' if up else 'down'}", "measure" if up and "on" in ps else "keep",
+                "Only matters if audio goes over Wi-Fi." if up else "Wi-Fi not in use.")
+        elif re.match(r"^(en|eth)", i) and rd(f"/sys/class/net/{i}/operstate") == "up":
+            eee = run(["ethtool", "--show-eee", i]).stdout if shutil.which("ethtool") else ""
+            m = re.search(r"EEE status: (\w+)", eee)
+            add("Network", f"Energy-Efficient Ethernet ({i})", m[1] if m else "unknown (ethtool not installed)", "measure",
+                "Only matters for network audio (AES67/Dante/streaming).")
+    add("Kernel", "NMI watchdog", "on" if rd("/proc/sys/kernel/nmi_watchdog") == "1" else "off", "measure", "Small periodic interrupt; realtime guides turn it off. A/B with the probes.")
+    tuners = [t for t in ("tlp", "powertop", "auto-cpufreq", "laptop-mode", "thermald") if run(["systemctl", "is-enabled", f"{t}.service"]).stdout.strip() == "enabled"]
+    add("Tools", "Power tuners (TLP, powertop auto-tune, auto-cpufreq...)", ", ".join(tuners) or "none enabled", "change" if tuners else "keep",
+        "These turn USB autosuspend on for everything, the interface included." if tuners else "Good. Never run powertop --auto-tune on a studio box.")
+    return items
+
+
+def parse_aspm(path):
+    """per-device PCIe link ASPM state from lspci -vvv (root)"""
+    out, dev = [], None
+    for l in rd(path).splitlines():
+        if l and not l[0].isspace():
+            dev = l.split(" ", 1)
+        m = re.search(r"LnkCtl:\s+ASPM ([^;]+);", l)
+        if m and dev:
+            out.append({"device": dev[0], "name": dev[1][:70], "aspm": m[1].strip()})
+    return out
+
+
+def disk_wake(path, n=8, idle=2.0):
+    """Cold-read latency: 4 KiB O_DIRECT reads after `idle` s of quiet (the NVMe may have dropped into a power state)
+    vs back-to-back warm reads. Uses a 64 MiB probe file; no setting is changed."""
+    import mmap, random
+    f = os.path.join(path, "disk-wake-probe.bin")
+    if not os.path.exists(f) or os.path.getsize(f) < 64 << 20:
+        with open(f, "wb") as w:
+            for _ in range(64): w.write(os.urandom(1 << 20))
+            w.flush(); os.fsync(w.fileno())
+    buf = mmap.mmap(-1, 4096)
+    fd = os.open(f, os.O_RDONLY | os.O_DIRECT)
+    def one():
+        off = random.randrange(0, (64 << 20) // 4096) * 4096
+        t = time.perf_counter(); os.preadv(fd, [buf], off); return (time.perf_counter() - t) * 1000
+    try:
+        warm = [one() for _ in range(n)]
+        cold = []
+        for _ in range(n):
+            time.sleep(idle); cold.append(one())
+    finally:
+        os.close(fd)
+    q = lambda xs: {"median_ms": round(sorted(xs)[len(xs) // 2], 3), "max_ms": round(max(xs), 3)}
+    return {"path": path, "idle_s": idle, "reads": n, "warm": q(warm), "cold": q(cold)}
+
+
 def snapshot(chain):
     classes = cpu_classes()
     gov = {c: sorted({rd(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_governor") for i in cpus}) for c, cpus in classes.items()}
@@ -400,12 +569,16 @@ h2 small{{font-size:13px;color:var(--dim);font-weight:400;display:block}}h3{{fon
 .kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}}.kpi{{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--acc);border-radius:12px;padding:10px 12px}}
 .kpi b{{display:block;font-size:24px}}.kpi span{{color:var(--dim);font-size:13px}}
 table{{width:100%;border-collapse:collapse;background:var(--panel);border-radius:10px;overflow:hidden;font-size:14.5px}}th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}}
-th{{background:var(--panel2);font-size:12px;text-transform:uppercase;color:var(--dim)}}tr.bad td{{color:var(--bad)}}.inv{{color:var(--bad);font-weight:700}}
+th{{background:var(--panel2);font-size:12px;text-transform:uppercase;color:var(--dim)}}tr.bad td{{color:var(--bad)}}td.v{{font-weight:800}}td.v.keep{{color:var(--ok)}}td.v.change{{color:var(--bad)}}td.v.measure,td.v.session{{color:var(--acc)}}.inv{{color:var(--bad);font-weight:700}}
 .small{{color:var(--dim);font-size:13.5px}}.notes{{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 16px}}code{{font:13px ui-monospace,monospace}}
 .wrap{{overflow-x:auto}}</style></head><body><main>
 <h1>Audio audit: {e(s['host'])}</h1><p class="small">{e(rep['id'])} · {e(s['cpu_model'])} · kernel {e(s['kernel'])} · interface {e(s['interface'].get('description'))} · took {rep['took_min']} min</p>
 <div class="notes"><b>Read this first</b><ul>{warn}</ul></div>
 {cards}
+<h2>Power saving settings</h2><p class="small">Windows lists say "disable all power saving". Here each one is judged on its actual value. keep = fine; session = switch it in session mode; measure = A/B it with the probes first; change = fix it.</p>
+<div class="wrap"><table><tr><th>area</th><th>setting</th><th>current</th><th>verdict</th></tr>{"".join(f"<tr><td>{e(i['area'])}</td><td><b>{e(i['name'])}</b><div class=small>{e(i['why'])}</div></td><td>{e(i['current'])}</td><td class='v {e(i['verdict'])}'>{e(i['verdict'])}</td></tr>" for i in s.get('power', []))}</table></div>
+{('<h3>PCIe link power per device (root)</h3><div class=wrap><table><tr><th>device</th><th>ASPM</th></tr>' + "".join(f"<tr><td>{e(a['device'])} {e(a['name'])}</td><td>{e(a['aspm'])}</td></tr>" for a in s['aspm_links']) + '</table></div>') if s.get('aspm_links') else '<p class=small>Per-link ASPM needs the root probes.</p>'}
+{(f"<h3>Disk wake test</h3><p>4 KiB direct reads from <code>{e(s['disk_wake'].get('path'))}</code>: warm median {s['disk_wake']['warm']['median_ms']} ms (max {s['disk_wake']['warm']['max_ms']}), after {s['disk_wake']['idle_s']:g} s idle median {s['disk_wake']['cold']['median_ms']} ms (max {s['disk_wake']['cold']['max_ms']}). A big cold/warm gap means the drive's power states add wake delay.</p>") if s.get('disk_wake', {}).get('warm') else ''}
 <h2>System snapshot</h2><div class="wrap"><table>
 <tr><td>CPU classes</td><td>{e(s['cpu_classes'])}</td></tr><tr><td>governor / EPP</td><td>{e(s['governor'])} / {e(s['epp'])}</td></tr>
 <tr><td>kernel cmdline</td><td><code>{e(s['cmdline'])}</code></td></tr><tr><td>threadirqs</td><td>{e(s['threadirqs'])}</td></tr>
@@ -439,6 +612,7 @@ def main():
     dump = pw_dump()
     chain = interface_chain(dump)
     snap = snapshot(chain)
+    snap["power"] = power_settings(dump, chain)
     orig = settings()
     rate = int(orig.get("clock.force-rate") or 0) or int(orig.get("clock.rate") or 48000)
     minq = int(orig.get("clock.min-quantum") or 32)
@@ -446,9 +620,10 @@ def main():
     jack = jack_clients(dump)
     emit(f"audio audit {rid}: interface {chain.get('description')} ({chain.get('hardware_sink')}), rate {rate}, loads {loads}")
     emit(f"  results: {outdir}")
-    if not chain.get("hardware_sink"):
-        notes.append("No hardware output found behind the default sink: buffer sweep results cannot be validated.")
     sweep_block = None
+    if not chain.get("hardware_sink"):
+        notes.append("No hardware output found behind the default sink (routing broken? run audio-doctor --fix): buffer sweep skipped.")
+        sweep_block = "skipped: no hardware output behind the default sink"
     if jack and not daw:
         sweep_block = "skipped: DAW/JACK client(s) connected (" + ", ".join(jack) + "); a buffer change would kill a DAW engine. Quit the DAW, or use --daw."
     if daw and not jack:
@@ -509,6 +684,11 @@ def main():
         else:
             procs["helper"] = helper
             emit("  root helper ready")
+            helper.stdin.write("lspci\n"); helper.stdin.flush()
+            while True:
+                l = helper.stdout.readline()
+                if not l or l.startswith("DONE lspci"): break
+            snap["aspm_links"] = parse_aspm(os.path.join(outdir, "raw", "lspci-vvv.txt"))
     else:
         notes.append("Root latency probes skipped (--no-root).")
 
@@ -554,6 +734,19 @@ def main():
             phases[load] = ph
     finally:
         restore()
+
+    if "--no-disk" not in ARGS:
+        emit("  disk wake test (cold vs warm 4 KiB reads, ~20 s)...")
+        try:
+            snap["disk_wake"] = disk_wake(opt("--disk-path") or STATE)
+            dw = snap["disk_wake"]
+            emit(f"    warm median {dw['warm']['median_ms']} ms / max {dw['warm']['max_ms']} ms; after {dw['idle_s']:g} s idle: median {dw['cold']['median_ms']} ms / max {dw['cold']['max_ms']} ms")
+        except OSError as e:
+            snap["disk_wake"] = {"error": str(e)}
+    pw = snap["power"]
+    emit("  power settings: " + ", ".join(f"{sum(1 for i in pw if i['verdict'] == v)} {v}" for v in ("keep", "session", "measure", "change")))
+    for i in pw:
+        if i["verdict"] == "change": emit(f"    CHANGE: {i['name']}: {i['current']} ({i['why']})")
 
     after = json.loads(run(["audio-doctor", "--json"], timeout=30).stdout or "{}")
     json.dump(after, open(f"{outdir}/raw/audio-doctor-after.json", "w"), indent=1)
