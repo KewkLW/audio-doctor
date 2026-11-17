@@ -75,15 +75,15 @@ th{background:var(--panel2);font-size:13px;text-transform:uppercase;letter-spaci
   <rect x="150" y="36" width="210" height="64" class="box" stroke="var(--app)"/>
   <text x="166" y="62" class="t">Browser tab</text><text x="166" y="84" class="s">YouTube, X, MPC page</text>
   <rect x="395" y="36" width="210" height="64" class="box" stroke="var(--app)"/>
-  <text x="411" y="62" class="t">Discord web app</text><text x="411" y="84" class="s">chromium --app=discord</text>
+  <text x="411" y="62" class="t">Discord, games</text><text x="411" y="84" class="s">incl. Wine/Proton (winepulse)</text>
   <rect x="640" y="36" width="210" height="64" class="box" stroke="var(--app)"/>
-  <text x="656" y="62" class="t">DAW / games</text><text x="656" y="84" class="s">Bitwig, Ableton, Wine</text>
+  <text x="656" y="62" class="t">DAWs</text><text x="656" y="84" class="s">Bitwig, Reaper, Ableton</text>
 
   <!-- pipewire-pulse -->
   <rect x="150" y="160" width="455" height="56" class="box" stroke="var(--pw)"/>
-  <text x="166" y="185" class="t">pipewire-pulse</text><text x="166" y="205" class="s">translator: apps speak "PulseAudio", this converts to PipeWire</text>
+  <text x="166" y="185" class="t">Pulse door (pipewire-pulse)</text><text x="166" y="205" class="s">for apps written for PulseAudio: browsers, chat, games</text>
   <rect x="640" y="160" width="210" height="56" class="box" stroke="var(--pw)"/>
-  <text x="656" y="185" class="t">JACK / native</text><text x="656" y="205" class="s">DAWs connect directly</text>
+  <text x="656" y="185" class="t">JACK door</text><text x="656" y="205" class="s">pipewire-jack: same server</text>
 
   <!-- sink -->
   <rect x="150" y="240" width="700" height="62" class="box" stroke="var(--pw)"/>
@@ -176,6 +176,13 @@ th{background:var(--panel2);font-size:13px;text-transform:uppercase;letter-spaci
     <li><b>Sink</b> = a place sound goes (output). <b>Source</b> = a place sound comes from (mic).</li>
     <li><b>RME Phones 1/2</b> is a <i>virtual</i> sink I created: a stereo front door that forwards into channels 1/2 of the real 8-channel device.</li></ul>
     <p class="analogy">The mixing desk and its patch bay.</p></div>
+  <div class="card" style="--c:var(--pw)"><span class="tag">2a · Three doors, one PipeWire</span><h3>Pulse, JACK, native</h3>
+    <p>Before PipeWire, Linux had two rival sound servers. <b>PulseAudio</b> was for desktop apps: easy, automatic, forgiving. <b>JACK</b> was for pro audio: tiny fixed buffers, every app on one shared clock, apps wired into each other like a patch bay.</p>
+    <p>PipeWire replaced <i>both</i> by speaking both languages. Apps still pick the door they were written for, but every door leads into the same mixing desk:</p>
+    <ul><li><b>Pulse door</b>: the browser, Discord, most native games, and Wine/Proton games (via <code>winepulse</code>).</li>
+    <li><b>JACK door</b>: DAWs like Bitwig and Reaper, for low latency and per-channel ports. Your <code>libjack</code> is PipeWire's, from the <code>pipewire-jack</code> package. There is no separate JACK server.</li>
+    <li><b>Native door</b>: <code>pw-play</code>, qpwgraph, and Ableton under Wine through <b>PipeASIO</b>.</li></ul>
+    <p class="analogy">Same desk, three kinds of input jacks.</p></div>
   <div class="card" style="--c:var(--wp)"><span class="tag">2b · WirePlumber</span><h3>The stage manager</h3>
     <p>It doesn't carry sound. It makes decisions: which device is the default, which profile a card uses (it's what keeps your RME on "Pro Audio"), and it wires every new app to the default output automatically. It also remembers per-app volumes.</p>
     <p class="analogy">The person who plugs cables in when a new musician walks on.</p></div>
