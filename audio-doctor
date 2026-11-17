@@ -318,11 +318,11 @@ def main():
         if AUDIO_APPS.search(comm) and comm not in seen:
             seen.add(comm)
             try:
-                cl = open(f"/proc/{pid}/cmdline").read().split("\0")
-                app_url = next((a.split("=", 1)[1] for a in cl if a.startswith("--app=")), None)
+                m = re.search(r"--app=https?://([^/\s\0]+)", open(f"/proc/{pid}/cmdline").read())
+                app_url = m.group(1) if m else None
             except OSError:
                 app_url = None
-            label = f"{comm} web app {re.sub(r'^https?://([^/]+).*', r'\\1', app_url)}" if app_url else comm
+            label = f"{comm} web app ({app_url})" if app_url else comm
             if pid not in stream_pids and not any(comm.lower() in (s["app"] or "").lower() for s in streams):
                 st = proc_start_mono_us(pid)
                 stale = st and pw_start and st < pw_start
