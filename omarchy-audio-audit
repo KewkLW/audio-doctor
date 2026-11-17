@@ -371,6 +371,11 @@ def power_settings(dump, chain):
             m = re.search(r"EEE status: (\w+)", eee)
             add("Network", f"Energy-Efficient Ethernet ({i})", m[1] if m else "unknown (ethtool not installed)", "measure",
                 "Only matters for network audio (AES67/Dante/streaming).")
+    if shutil.which("adi2") and "2a39:" in run(["lsusb"]).stdout:
+        m = re.search(r"=\s*(\S+)", run(["adi2", "get", "device.auto_standby"]).stdout)
+        st = m[1] if m else "?"
+        add("Device", "RME ADI-2 auto-standby", st if st != "?" else "unreadable (a DAW holds its MIDI port?)", "keep" if st == "off" else ("measure" if st == "?" else "change"),
+            "Never sleeps." if st == "off" else "After a quiet stretch the ADI-2 powers down and drops off USB: audio stops until its button is pressed, and PipeWire has to recover the device. Set it off for studio use (adi2 set device.auto_standby off); automated runs use studio-keepalive.")
     add("Kernel", "NMI watchdog", "on" if rd("/proc/sys/kernel/nmi_watchdog") == "1" else "off", "measure", "Small periodic interrupt; realtime guides turn it off. A/B with the probes.")
     tuners = [t for t in ("tlp", "powertop", "auto-cpufreq", "laptop-mode", "thermald") if run(["systemctl", "is-enabled", f"{t}.service"]).stdout.strip() == "enabled"]
     add("Tools", "Power tuners (TLP, powertop auto-tune, auto-cpufreq...)", ", ".join(tuners) or "none enabled", "change" if tuners else "keep",
@@ -636,6 +641,9 @@ def main():
     if daw:
         sweep_block = "skipped in DAW mode (sizes are never changed while a DAW is connected)"
     json.dump(json.loads(run(["audio-doctor", "--json"], timeout=30).stdout or "{}"), open(f"{outdir}/raw/audio-doctor-before.json", "w"), indent=1)
+    ka = shutil.which("studio-keepalive") and not jack
+    if ka:
+        emit("  " + run(["studio-keepalive", "on"]).stdout.strip())
 
     # ---- state we own, restored on every exit path
     procs = {}
@@ -752,6 +760,8 @@ def main():
     for i in pw:
         if i["verdict"] == "change": emit(f"    CHANGE: {i['name']}: {i['current']} ({i['why']})")
 
+    if ka:
+        emit("  " + run(["studio-keepalive", "off"]).stdout.strip())
     after = json.loads(run(["audio-doctor", "--json"], timeout=30).stdout or "{}")
     json.dump(after, open(f"{outdir}/raw/audio-doctor-after.json", "w"), indent=1)
     breaks = [f["message"] for f in after.get("findings", []) if f.get("severity") == "BREAK"]
