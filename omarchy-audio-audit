@@ -349,10 +349,14 @@ def power_settings(dump, chain):
         add("Audio", "PipeWire suspend of the interface", ", ".join(st), "keep" if st == ["0"] else "change",
             "Never suspends." if st == ["0"] else "The interface sleeps when idle: pop / relock on the next sound. WirePlumber rule session.suspend-timeout-seconds = 0.")
     # disk
-    apst = rd("/sys/module/nvme_core/parameters/default_ps_max_latency_us")
-    if apst:
-        add("Disk", "NVMe power states (APST)", f"allows up to {int(apst) / 1000:g} ms wake latency", "measure",
-            "Matters when a DAW streams samples from disk; see the disk wake test. Cap it lower if cold reads are slow.")
+    for c in sorted(glob.glob("/sys/class/nvme/nvme*")):  # per controller: the live value, not the module default
+        tol = rd(f"{c}/power/pm_qos_latency_tolerance_us")
+        if not tol.isdigit(): continue
+        capped = int(tol) <= 2000
+        add("Disk", f"NVMe power states: {os.path.basename(c)} {rd(c + '/model').strip()[:22]}", f"wake latency allowed up to {int(tol) / 1000:g} ms",
+            "keep" if capped else "measure",
+            "Capped: no deep-sleep stall on the first read after quiet." if capped else
+            "Deep power states allowed (~7 ms first read after quiet on these Sabrents). Cap it if this drive holds samples or plugin libraries.")
     add("Disk", "Write-back flushing", f"dirty {rd('/proc/sys/vm/dirty_background_bytes')}/{rd('/proc/sys/vm/dirty_bytes')} bytes, every {int(rd('/proc/sys/vm/dirty_writeback_centisecs', '0') or 0) / 100:g} s", "keep",
         "Bounded write bursts are good for recording.")
     # network
