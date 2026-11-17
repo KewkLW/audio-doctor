@@ -44,6 +44,28 @@ omarchy-audio-audit --disk-path /path/to/samples     # disk wake test on the sam
 - Output: `~/.local/state/omarchy-studio/audit/<time>/` (`audit.json`, `report.html`, `raw/`), `watch_seed` for the future watcher.
 - Helpers in `audit/`: `footprint NAME` / `footprint compare A B` (memory/CPU before vs after, e.g. DAW loaded), `quiet-park park|unpark|status` (freeze background stuff for a test), `quiet-report`, `boot-inventory OUT.html` (everything that starts at boot).
 
+## Keep the interface awake: studio-keepalive (ALWAYS for unattended runs)
+The RME ADI-2 has **auto-standby**: after a quiet stretch it powers down and **drops off USB** (kernel: `usb 1-2: USB disconnect`, no reconnect). Audio is then gone until someone presses its button or uses its remote; the host can't wake it (a USB port power-cycle doesn't either).
+```
+studio-keepalive on        # saves device.auto_standby and sets it off (refuses if the RME is asleep/off USB)
+studio-keepalive off       # restores the saved value (also after a crashed run)
+studio-keepalive status
+```
+- Run `on` **before** a DAW starts and `off` **after** it quits: Bitwig holds the ADI-2's MIDI port, and `adi2` can't reach the device while it does.
+- `audit/m2-bisect.sh` and `omarchy-audio-audit` already do this; any new long or unattended test must too (refuse to run if `on` fails).
+- Permanent choice is the user's: `adi2 set device.auto_standby off|30min|1h|2h|4h`.
+
+## Test and tuning tools (audit/)
+| tool | what it does |
+|---|---|
+| `daw-ramp` | Bitwig dropout ramp/bisect through BitwigBridge (opens chunk projects, activates groups, proves play, counts xruns per sample). `m2-bisect.sh` wraps it unattended (mute, keepalive, silent launch, restore). |
+| `power-ab` | root, once: runtime-only A/B of NMI watchdog, GPU lock under load, NVMe APST, ASPM; originals saved, reverted, read back |
+| `studio-power-apply` | root, once: NVMe APST cap per audio drive (udev by serial, gated) + `studio-gpu-lock` service |
+| `omarchy-audio-watch` | always-on 30 s monitor (GPU/CPU/NVMe/xruns/Xid, activity-tagged) + `report OUT.html`; `event "text"` marks changes |
+| `footprint NAME` / `compare A B` | memory/CPU/threads before vs after (e.g. DAW loaded) |
+| `quiet-park park|unpark` | freeze background services for a clean test (never auto-unpark) |
+| `boot-inventory OUT.html` | everything that starts at boot, grouped, with recommendations |
+
 ## whatis: which app is that process really?
 `whatis` (same repo, symlinked into ~/.local/bin) names the real app behind generic process names. audio-doctor imports it to label every stream owner and app.
 ```
@@ -82,6 +104,9 @@ Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-prot
 | tone reaches hardware sink, still silent | device/cable/phones side | check `adi2 dump`, phones jack, cable |
 | stream plays to a non-default sink | per-app routing stuck | `pactl move-sink-input <idx> rme_phones` |
 | browser/system audio silent right after starting Bitwig | Bitwig (PipeWire backend) re-creates the RME nodes; old loopback flags don't relink | `audio-doctor --fix`; permanent once the new flags are live (PipeWire start) |
+| RME gone: `lsusb` has no `2a39:`, kernel shows `usb 1-2: USB disconnect` with no reconnect | **RME auto-standby** (or powered off) | press its button / remote (the host can't wake it); for test runs use `studio-keepalive`; it relinks by itself on wake |
+| RME nodes present but **no ports** (`pw-link -i` has no `RME_ADI...playback_AUX`), loopbacks unlinked, `--fix` can't link, Bitwig engine hangs after "Opening MIDI device" | WirePlumber wedged on the device after a USB reset/re-enumeration (2026-11-17 12:38) | `systemctl --user restart wireplumber` (apps keep their connections; NOT a PipeWire restart), then quit/relaunch the DAW |
+| graph stuck at a forced quantum, stray `pw-play` reading stdin | `omarchy-studio-bitwig` wrapper's warm-up player hung with no sink | kill the wrapper + its pw-play by PID with SIGKILL (its EXIT trap changes the buffer), then `pw-metadata -n settings 0 clock.force-quantum 1024` and `0` |
 
 ## Rules
 - Avoid restarting PipeWire while the user has apps open: it is what stales their audio. If you must, run `whatis --audio` first and tell the user which apps to reopen.
