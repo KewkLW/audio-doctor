@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""footprint NAME [--secs 30] | footprint compare A B
+System footprint snapshot for before/after comparisons (e.g. no DAW vs DAW loaded with tracks inactive).
+Measures over a window: whole-machine CPU busy, per-process CPU (top 15), memory (used, available,
+swap), process/thread counts, load average, package temperature, average core clock, PipeWire graph
+(driver quantum, per-node busy/quantum, ERR). Saves ~/.local/state/omarchy-studio/footprint/NAME.json."""
+import glob, json, os, re, subprocess as sp, sys, time
+
+DIR = os.path.expanduser("~/.local/state/omarchy-studio/footprint")
+
+
+def rd(p, d=""):
+    try: return open(p).read().strip()
+    except OSError: return d
+
+
+def proc_times():
+    out = {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit(): continue
+        st = rd(f"/proc/{p}/stat")
+        if not st: continue
+        r = st.rsplit(")", 1)
+        f = r[1].split()
+        out[int(p)] = (int(f[11]) + int(f[12]), r[0].split("(", 1)[1])
+    return out
+
+
+def meminfo():
+    m = {l.split(":")[0]: int(l.split()[1]) for l in rd("/proc/meminfo").splitlines()}
+    return {"total_gb": round(m["MemTotal"] / 2**20, 2), "used_gb": round((m["MemTotal"] - m["MemAvailable"]) / 2**20, 2),
+            "available_gb": round(m["MemAvailable"] / 2**20, 2), "swap_used_gb": round((m["SwapTotal"] - m["SwapFree"]) / 2**20, 2)}
+
+
+def pw_top():
+    out = sp.run(["pw-top", "-b", "-n", "3"], capture_output=True, text=True, timeout=15).stdout.splitlines()
+    rows, hdr = {}, None
+    for line in out:
+        if line.startswith("S ") and "NAME" in line:
+            hdr = (line.index("FORMAT"), line.index("NAME")); continue
+        if not hdr or len(line) < hdr[1]: continue
+        h = line[:hdr[0]].split()
+        if len(h) < 9 or not h[1].isdigit(): continue
+        rows[line[hdr[1]:].strip()] = {"state": h[0], "quant": h[2], "wait": h[4], "busy": h[5], "w/q": h[6], "b/q": h[7], "err": h[8]}
+    return {n: r for n, r in rows.items() if r["state"] == "R"}
+
+
+def snap(name, secs):
+    hz = os.sysconf("SC_CLK_TCK")
+    s0, p0 = [int(x) for x in rd("/proc/stat").splitlines()[0].split()[1:]], proc_times()
+    temps, mhz = [], []
+    t_end = time.time() + secs
+    while time.time() < t_end:
+        z = next((z for z in glob.glob("/sys/class/thermal/thermal_zone*") if rd(f"{z}/type") == "x86_pkg_temp"), None)
+        if z: temps.append(int(rd(f"{z}/temp")) / 1000)
+        f = [int(rd(c)) for c in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq") if rd(c).isdigit()]
+        if f: mhz.append(sum(f) / len(f) / 1000)
+        time.sleep(1)
+    s1, p1 = [int(x) for x in rd("/proc/stat").splitlines()[0].split()[1:]], proc_times()
+    d = [b - a for a, b in zip(s0, s1)]
+    per = {}
+    for pid, (t, comm) in p1.items():
+        dt = t - p0.get(pid, (t, comm))[0]
+        if dt > 0:
+            per.setdefault(comm, 0); per[comm] += dt / hz / secs * 100
+    top = sorted(per.items(), key=lambda x: -x[1])[:15]
+    nthreads = sum(int(m[1]) for p in os.listdir("/proc") if p.isdigit() for m in [re.search(r"Threads:\s+(\d+)", rd(f"/proc/{p}/status"))] if m)
+    js = {"name": name, "time": time.strftime("%F %T"), "secs": secs,
+          "cpu_busy_pct": round(100 * (1 - (d[3] + d[4]) / max(sum(d), 1)), 2),
+          "top_cpu_pct_of_one_core": [(c, round(v, 2)) for c, v in top],
+          "memory": meminfo(), "processes": len([p for p in os.listdir("/proc") if p.isdigit()]), "threads": nthreads,
+          "loadavg": rd("/proc/loadavg").split()[:3],
+          "pkg_temp_c": {"min": min(temps), "avg": round(sum(temps) / len(temps), 1), "max": max(temps)} if temps else None,
+          "avg_core_mhz": round(sum(mhz) / len(mhz)) if mhz else None,
+          "pipewire_running_nodes": pw_top(),
+          "pipewire_settings": dict(re.findall(r"key:'(clock\.[^']+)' value:'([^']*)'", sp.run(["pw-metadata", "-n", "settings", "0"], capture_output=True, text=True).stdout)),
+          "bitwig_running": bool(sp.run(["pgrep", "-f", "^/opt/bitwig-studio/bin/Bitwig"], capture_output=True).stdout.strip())}
+    os.makedirs(DIR, exist_ok=True)
+    json.dump(js, open(f"{DIR}/{name}.json", "w"), indent=1)
+    m = js["memory"]
+    print(f"footprint '{name}' ({secs} s, {js['time']}): CPU busy {js['cpu_busy_pct']}% of all threads, "
+          f"memory used {m['used_gb']} / {m['total_gb']} GB (swap {m['swap_used_gb']} GB), {js['processes']} processes / {nthreads} threads, "
+          f"load {' '.join(js['loadavg'])}, package {js['pkg_temp_c']}°C, avg clock {js['avg_core_mhz']} MHz, Bitwig running: {js['bitwig_running']}")
+    print("  top CPU (% of one core): " + ", ".join(f"{c} {v}" for c, v in top[:8]))
+    print("  PipeWire running nodes: " + (", ".join(f"{n[:40]} q{r['quant']} b/q {r['b/q']}" for n, r in js["pipewire_running_nodes"].items()) or "none (graph idle)"))
+
+
+def compare(a, b):
+    A, B = (json.load(open(f"{DIR}/{x}.json")) for x in (a, b))
+    def row(label, f):
+        va, vb = f(A), f(B)
+        try: delta = f"{vb - va:+.2f}"
+        except TypeError: delta = ""
+        print(f"  {label:34} {str(va):>14} {str(vb):>14} {delta:>10}")
+    print(f"  {'':34} {a:>14} {b:>14} {'change':>10}")
+    row("CPU busy, % of all threads", lambda j: j["cpu_busy_pct"])
+    row("memory used, GB", lambda j: j["memory"]["used_gb"])
+    row("swap used, GB", lambda j: j["memory"]["swap_used_gb"])
+    row("processes", lambda j: j["processes"])
+    row("threads", lambda j: j["threads"])
+    row("package temp avg, °C", lambda j: (j["pkg_temp_c"] or {}).get("avg"))
+    row("avg core clock, MHz", lambda j: j["avg_core_mhz"])
+    print("  new top CPU in", b + ":", ", ".join(f"{c} {v}" for c, v in B["top_cpu_pct_of_one_core"] if c not in dict(A["top_cpu_pct_of_one_core"]))[:300])
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if not a: print(__doc__)
+    elif a[0] == "compare": compare(a[1], a[2])
+    else: snap(a[0], int(a[a.index("--secs") + 1]) if "--secs" in a else 30)
