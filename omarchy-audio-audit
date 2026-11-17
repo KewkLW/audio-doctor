@@ -306,10 +306,12 @@ def sweep(sizes, hold, card, rate, emit):
         drv_q = max((r["quant"] for r in iface.values()), default=None)
         per = {n: r["err"] - a.get(n, {}).get("err", r["err"]) for n, r in b.items()}
         bad = {n: v for n, v in per.items() if v > 0}
+        iface_x = sum(v for n, v in bad.items() if card and card in n)
         r = {"quantum": q, "block_ms": round(q / rate * 1000, 2), "seconds": hold, "interface_quant": drv_q,
              "valid": drv_q == q, "xruns": sum(bad.values()), "xruns_by_node": bad,
+             "interface_xruns": iface_x, "client_xruns": sum(bad.values()) - iface_x,
              "interface_busy_over_quantum": max((x["bq"] for x in iface.values()), default=None)}
-        res.append(r); emit(f"    quantum {q:5} ({r['block_ms']:5} ms): xruns {r['xruns']:3}  driver ran at {drv_q}{'' if r['valid'] else '  INVALID'}")
+        res.append(r); emit(f"    quantum {q:5} ({r['block_ms']:5} ms): interface xruns {iface_x:3}, client xruns {r['client_xruns']:3}  driver ran at {drv_q}{'' if r['valid'] else '  INVALID'}")
     return res
 
 
@@ -326,8 +328,10 @@ def watch_seed(phases):
     seed = {}
     for name, ph in phases.items():
         clean = [s["quantum"] for s in ph.get("sweep") or [] if s["valid"] and s["xruns"] == 0]
+        iclean = [s["quantum"] for s in ph.get("sweep") or [] if s["valid"] and s.get("interface_xruns", s["xruns"]) == 0]
         worst = max((v["max_us"] for v in (ph.get("cyclictest", {}).get("nohold") or {}).values()), default=None)
-        seed[name] = {"smallest_clean_quantum": min(clean) if clean else None, "sched_worst_us": worst}
+        seed[name] = {"smallest_clean_quantum": min(clean) if clean else None,
+                      "smallest_interface_clean_quantum": min(iclean) if iclean else None, "sched_worst_us": worst}
     return {"per_load": seed,
             "note": "Seeds, not rules: the watcher should alert on xruns at the session's quantum, and on scheduling latency or temperature beyond what this baseline measured."}
 
@@ -353,7 +357,7 @@ def render(rep, path):
         return out or "<tr><td colspan=4>skipped</td></tr>"
     def sw_rows(ph):
         if ph.get("sweep_skipped"): return f"<tr><td colspan=5>{e(ph['sweep_skipped'])}</td></tr>"
-        return "".join(f"<tr class='{'bad' if s['xruns'] else ''}'><td><b>{s['quantum']}</b></td><td>{s['block_ms']} ms</td><td>{s['xruns']}</td>"
+        return "".join(f"<tr class='{'bad' if s['xruns'] else ''}'><td><b>{s['quantum']}</b></td><td>{s['block_ms']} ms</td><td>{s.get('interface_xruns', '?')}</td><td>{s.get('client_xruns', s['xruns'])}</td>"
                        f"<td>{s['interface_quant']}{'' if s['valid'] else ' <span class=inv>INVALID</span>'}</td><td>{e(s['interface_busy_over_quantum'])}</td></tr>" for s in ph.get("sweep") or [])
     cards = ""
     for name, ph in phases.items():
@@ -366,7 +370,7 @@ def render(rep, path):
 <div class="kpi"><b>{e(c0.get('pkg_temp_c'))}→{e(c1.get('pkg_temp_c'))}°C</b><span>package temperature</span></div>
 <div class="kpi"><b>{e(thr)} ms</b><span>thermal throttling during phase</span></div></div>
 <p class="small">load average {e(' '.join(c0.get('loadavg', [])))} → {e(' '.join(c1.get('loadavg', [])))} · top CPU: {e(', '.join(c1.get('top_cpu', [])[:4]))}</p>
-<h3>Buffer sweep (xruns per size)</h3><table><tr><th>quantum</th><th>block</th><th>xruns</th><th>interface ran at</th><th>busy/quantum</th></tr>{sw_rows(ph)}</table>
+<h3>Buffer sweep (xruns per size)</h3><table><tr><th>quantum</th><th>block</th><th>interface xruns</th><th>client xruns (test stream)</th><th>interface ran at</th><th>busy/quantum</th></tr>{sw_rows(ph)}</table>
 <h3>Scheduling latency: cyclictest</h3><table><tr><th>C-state hold</th><th>cores</th><th>worst</th><th>samples &gt;100 / &gt;500 / &gt;1000 µs</th></tr>{ct_rows(ph)}</table>
 <h3>rtla timerlat</h3><table><tr><th>C-state hold</th><th>cores</th><th>IRQ max</th><th>thread max</th></tr>{tl_rows(ph)}</table>
 {('<h3>DAW phase</h3><p>' + e(json.dumps(ph['daw'])) + '</p>') if ph.get('daw') else ''}</section>"""
@@ -521,6 +525,7 @@ def main():
                     if v: emit(f"    cyclictest {h}: " + ", ".join(f"{c} worst {x['max_us']} µs" for c, x in v.items()))
             if sweep_block:
                 ph["sweep_skipped"] = sweep_block
+                emit(f"    buffer sweep {sweep_block}")
             else:
                 emit(f"    buffer sweep {sizes} ({hold_s} s each)...")
                 ph["sweep"] = sweep(sizes, hold_s, chain.get("card"), rate, emit)
@@ -544,6 +549,7 @@ def main():
     now = settings()
     if now.get("clock.force-quantum") != orig.get("clock.force-quantum") or now.get("clock.force-rate") != orig.get("clock.force-rate"):
         notes.append(f"PipeWire settings NOT restored: found {orig.get('clock.force-quantum')}/{orig.get('clock.force-rate')}, now {now.get('clock.force-quantum')}/{now.get('clock.force-rate')}")
+    notes.append("Xruns are split: 'interface' = the audio device's own nodes missed a cycle; 'client' = a stream (here the audit's own test stream, an ordinary client) missed its deadline while the device kept time.")
     notes.append("The buffer sweep plays silence with no DSP load: it shows the interface wakes on time at each size, not that a full project will run there. The DAW phase covers that.")
     if "stress" in loads:
         notes.append("'stress' is a fixed synthetic recipe for comparable runs, not real agent load.")
