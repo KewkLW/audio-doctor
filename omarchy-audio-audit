@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""omarchy-audio-audit: measure how fit THIS machine is for realtime audio (Omarchy Studio W1c,
+measured half). Meant to run on the first start of an Omarchy Studio install, after any tuning
+change (before/after proof), and when troubleshooting. It reports numbers and validity flags,
+not verdicts: the agent skill judges them for this system.
+
+Per load condition (idle = the box as it is, stress = a fixed synthetic recipe):
+  context    load average, package temperature, throttle-time delta, top CPU consumers
+  latency    (root) turbostat; cyclictest without/with the C-state hold; rtla timerlat
+             without/with the hold. Split by core class (P/E on hybrid Intel)
+  buffers    PipeWire quantum sweep on the default output's interface: xruns per size,
+             valid only if the interface's driver really ran at that size
+Plus a system snapshot (CPU, governor/EPP, kernel, PipeWire settings, interface, USB power),
+audio-doctor before and after, a JSON file and an HTML report.
+
+  omarchy-audio-audit                 full run (~12 min; ONE sudo approval for the latency probes)
+  omarchy-audio-audit --quick         short probes (~4 min), for a smoke test
+  omarchy-audio-audit --no-root       skip the root latency probes (no sudo)
+  omarchy-audio-audit --loads idle    only one load condition (idle,stress)
+  omarchy-audio-audit --sizes 1024,128,64
+  omarchy-audio-audit --daw 60        DAW phase: a JACK client (DAW) must be connected; measures
+                                      xruns at the CURRENT size for 60 s per load, never changes it
+  omarchy-audio-audit --first-run     write to the 'first-run' slot once (skips if it exists)
+  omarchy-audio-audit --sudo keyring  unattended: sudo password from the keyring instead of ntfy
+  omarchy-audio-audit --label NAME    tag the result dir
+
+Safety: restores clock.force-quantum and clock.force-rate to exactly what it found, on every
+exit path; refuses the buffer sweep while a JACK client (DAW) is connected (a size change kills
+Bitwig's engine); never restarts PipeWire; stops its own stress-ng and silence stream by PID.
+Results: ~/.local/state/omarchy-studio/audit/<time>[-label]/ (audit.json, report.html, raw/).
+"""
+import atexit, glob, html, json, os, re, shutil, signal, subprocess as sp, sys, time
+
+ARGS = sys.argv[1:]
+def opt(name, default=None):
+    return ARGS[ARGS.index(name) + 1] if name in ARGS and ARGS.index(name) + 1 < len(ARGS) else default
+
+STATE = os.path.expanduser("~/.local/state/omarchy-studio/audit")
+STRESS = ["stress-ng", "--cpu", "0", "--cpu-load", "70", "--vm", "2", "--vm-bytes", "512M"]
+STRESS_LABEL = "synthetic: stress-ng --cpu <all> --cpu-load 70 --vm 2 --vm-bytes 512M (about load average 22 on 32 threads, close to typical agent load; NOT real agent load)"
+
+
+def run(cmd, timeout=15, **kw):
+    try:
+        return sp.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+    except Exception as e:
+        return sp.CompletedProcess(cmd, 1, "", str(e))
+
+
+def rd(path, default=""):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return default
+
+
+# ====================================================================== root helper
+# Started once through sudo; only MEASURES. Reads commands on stdin, answers on stdout.
+def root_helper(outdir, rtla, user):
+    T = "/sys/kernel/tracing"
+    print("READY", flush=True)
+    for line in sys.stdin:
+        cmd = line.split()
+        if not cmd:
+            continue
+        if cmd[0] == "quit":
+            break
+        if cmd[0] != "probe":
+            continue
+        phase, ct, tl = cmd[1], int(cmd[2]), int(cmd[3])
+        d = os.path.join(outdir, "raw", phase)
+        os.makedirs(d, exist_ok=True)
+        log = []
+        def step(name, argv, timeout, out):
+            t0 = time.time()
+            r = sp.run(argv, capture_output=True, text=True, timeout=timeout) if shutil.which(argv[0]) or os.path.exists(argv[0]) else None
+            if r is None:
+                log.append({"step": name, "skipped": f"{argv[0]} not installed"}); return
+            open(os.path.join(d, out), "w").write(r.stdout + r.stderr)
+            log.append({"step": name, "rc": r.returncode, "secs": round(time.time() - t0, 1)})
+        try:
+            step("turbostat", ["turbostat", "--quiet", "--interval", "5", "--num_iterations", "2", "--show",
+                 "Core,CPU,Busy%,Bzy_MHz,CPU%c1,CPU%c6,CPU%c7,CoreTmp,PkgTmp,PkgWatt,IRQ"], 30, "turbostat.txt")
+            for hold in ("nohold", "hold"):
+                # --laptop = do NOT hold /dev/cpu_dma_latency (cyclictest holds it at 0 by default)
+                argv = ["cyclictest", "-m", "-S", "-p", "80", "-i", "1000", "-D", str(ct), "-q"] + \
+                       (["--laptop"] if hold == "nohold" else []) + \
+                       ["-h", "3000", f"--histfile={d}/ct-{hold}.hist", f"--json={d}/ct-{hold}.json"]
+                step(f"cyclictest {hold}", argv, ct + 20, f"ct-{hold}.txt")
+            tracer = rd(f"{T}/current_tracer", "nop")
+            if not rtla or not os.path.exists(rtla):
+                log.append({"step": "timerlat", "skipped": "rtla not installed"})
+            elif tracer != "nop":
+                log.append({"step": "timerlat", "skipped": f"tracer busy ({tracer})"})
+            else:
+                for hold in ("nohold", "hold"):
+                    argv = [rtla, "timerlat", "top", "-d", str(tl), "-q", "-P", "f:80", "--no-aa"] + (["--dma-latency", "0"] if hold == "hold" else [])
+                    step(f"timerlat {hold}", argv, tl + 25, f"timerlat-{hold}.txt")
+                try: open(f"{T}/current_tracer", "w").write("nop")
+                except OSError: pass
+        except Exception as e:
+            log.append({"error": str(e)})
+        json.dump(log, open(os.path.join(d, "root-steps.json"), "w"), indent=1)
+        sp.run(["chown", "-R", f"{user}:{user}", outdir])
+        print(f"DONE {phase}", flush=True)
+    sp.run(["chown", "-R", f"{user}:{user}", outdir])
+
+
+# ====================================================================== PipeWire helpers
+def settings():
+    out = run(["pw-metadata", "-n", "settings", "0"]).stdout
+    return {m[1]: m[2] for m in re.finditer(r"key:'([^']+)' value:'([^']*)'", out)}
+
+
+def setmeta(key, val):
+    run(["pw-metadata", "-n", "settings", "0", key, str(val)])
+
+
+def pw_dump():
+    try:
+        return json.loads(run(["pw-dump"]).stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def jack_clients(dump):
+    return sorted({(o.get("info") or {}).get("props", {}).get("node.name", "?") for o in dump
+                   if o.get("type", "").endswith("Node") and (o.get("info") or {}).get("props", {}).get("client.api") == "jack"})
+
+
+def interface_chain(dump):
+    """default sink -> (through loopbacks) -> hardware sink; card id for matching its nodes."""
+    nodes = {o["id"]: (o.get("info") or {}).get("props", {}) for o in dump if o.get("type", "").endswith("Node")}
+    by_name = {p.get("node.name"): i for i, p in nodes.items()}
+    links = [((o.get("info") or {}).get("output-node-id"), (o.get("info") or {}).get("input-node-id"))
+             for o in dump if o.get("type", "").endswith("Link")]
+    default = run(["pactl", "get-default-sink"]).stdout.strip()
+    hw, cur, seen = None, default, set()
+    for _ in range(4):
+        if not cur or cur in seen: break
+        seen.add(cur)
+        if cur.startswith(("alsa_output", "bluez_output")):
+            hw = cur; break
+        nid = by_name.get(cur + ".out") or by_name.get(cur)
+        nxt = [nodes[b].get("node.name") for a, b in links if a == nid and b in nodes]
+        cur = nxt[0] if nxt else None
+    card = None
+    if hw:
+        m = re.match(r"alsa_output\.(.+)\.[^.]+$", hw)
+        card = m[1] if m else hw
+    return {"default_sink": default, "hardware_sink": hw, "card": card,
+            "description": next((p.get("node.description") for p in nodes.values() if p.get("node.name") == hw), hw)}
+
+
+def pw_top():
+    """{name: {state, quant, err, bq}} from the last pw-top batch frame (column offsets from the header)."""
+    out = run(["pw-top", "-b", "-n", "3"], timeout=12).stdout.splitlines()
+    rows, hdr = {}, None
+    for line in out:
+        if line.startswith("S ") and "NAME" in line:
+            hdr = (line.index("FORMAT"), line.index("NAME")); continue
+        if not hdr or len(line) < hdr[1]:
+            continue
+        head = line[:hdr[0]].split()
+        if len(head) < 9 or not head[1].isdigit():
+            continue
+        name = line[hdr[1]:].strip().lstrip("+").strip()
+        try:
+            rows[name] = {"state": head[0], "quant": int(head[2]), "rate": int(head[3]), "bq": head[7], "err": int(head[8])}
+        except ValueError:
+            pass
+    return rows
+
+
+# ====================================================================== snapshot
+def cpu_classes():
+    core, atom = rd("/sys/devices/cpu_core/cpus"), rd("/sys/devices/cpu_atom/cpus")
+    def expand(s):
+        out = []
+        for part in s.split(","):
+            if "-" in part:
+                a, b = part.split("-"); out += list(range(int(a), int(b) + 1))
+            elif part.strip():
+                out.append(int(part))
+        return out
+    if core and atom:
+        return {"P": expand(core), "E": expand(atom)}
+    return {"all": list(range(os.cpu_count() or 1))}
+
+
+def pkg_temp():
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if rd(f"{z}/type") == "x86_pkg_temp":
+            v = rd(f"{z}/temp")
+            return int(v) / 1000 if v.isdigit() else None
+    r = run(["sensors", "-j"])
+    try:
+        for chip in json.loads(r.stdout).values():
+            for k, v in chip.items():
+                if k.startswith(("Package id", "Tctl")):
+                    return next(x for kk, x in v.items() if kk.endswith("_input"))
+    except Exception:
+        pass
+    return None
+
+
+def throttle_ms():
+    v = rd("/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms")
+    return int(v) if v.isdigit() else None
+
+
+def context():
+    top = run(["ps", "-eo", "pcpu,comm", "--sort=-pcpu", "--no-headers"]).stdout.splitlines()[:6]
+    return {"time": time.strftime("%F %T"), "loadavg": rd("/proc/loadavg").split()[:3], "pkg_temp_c": pkg_temp(),
+            "throttle_ms": throttle_ms(), "top_cpu": [l.strip() for l in top]}
+
+
+def usb_audio_power():
+    out = []
+    for d in glob.glob("/sys/bus/usb/devices/*:*"):
+        if rd(f"{d}/bInterfaceClass") != "01":
+            continue
+        dev = d.rsplit("/", 1)[0] + "/" + os.path.basename(d).split(":")[0]
+        item = {"device": rd(f"{dev}/product", os.path.basename(dev)), "power_control": rd(f"{dev}/power/control"),
+                "autosuspend_ms": rd(f"{dev}/power/autosuspend_delay_ms"), "speed_mbps": rd(f"{dev}/speed")}
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def snapshot(chain):
+    classes = cpu_classes()
+    gov = {c: sorted({rd(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_governor") for i in cpus}) for c, cpus in classes.items()}
+    epp = {c: sorted({rd(f"/sys/devices/system/cpu/cpu{i}/cpufreq/energy_performance_preference") for i in cpus}) for c, cpus in classes.items()}
+    return {"host": os.uname().nodename, "kernel": os.uname().release, "kernel_version": os.uname().version,
+            "cmdline": rd("/proc/cmdline"), "cpu_model": next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), "?"),
+            "cpu_classes": {c: f"{v[0]}-{v[-1]}" if v == list(range(v[0], v[-1] + 1)) else v for c, v in classes.items()},
+            "governor": gov, "epp": epp, "threadirqs": "threadirqs" in rd("/proc/cmdline"),
+            "rt_runtime_us": rd("/proc/sys/kernel/sched_rt_runtime_us"), "swappiness": rd("/proc/sys/vm/swappiness"),
+            "pipewire_version": run(["pipewire", "--version"]).stdout.strip().splitlines()[-1:] or [""],
+            "pipewire_settings": {k: v for k, v in settings().items() if k.startswith("clock.")},
+            "interface": chain, "usb_audio_power": usb_audio_power(),
+            "tools": {t: bool(shutil.which(t)) for t in ("cyclictest", "rtla", "turbostat", "stress-ng", "pw-top")}}
+
+
+# ====================================================================== parsers
+def parse_cyclictest(d, hold, classes):
+    try:
+        j = json.load(open(f"{d}/ct-{hold}.json"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    overflow = []
+    m = re.search(r"# Histogram Overflows:(.*)", rd(f"{d}/ct-{hold}.hist"))
+    if m:
+        overflow = [int(x) for x in m[1].split()]
+    out = {}
+    for c, cpus in classes.items():
+        mx, b100, b500, b1000 = 0, 0, 0, 0
+        for t in j.get("thread", {}).values():
+            if t.get("cpu") not in cpus: continue
+            mx = max(mx, t.get("max", 0))
+            for us, n in t.get("histogram", {}).items():
+                us = int(us)
+                b100 += n if us > 100 else 0; b500 += n if us > 500 else 0; b1000 += n if us > 1000 else 0
+            ov = overflow[t["cpu"]] if t.get("cpu", 99999) < len(overflow) else 0
+            b100 += ov; b500 += ov; b1000 += ov
+        out[c] = {"max_us": mx, "over_100": b100, "over_500": b500, "over_1000": b1000}
+    return out
+
+
+def parse_timerlat(d, hold, classes):
+    txt = rd(f"{d}/timerlat-{hold}.txt")
+    if not txt:
+        return None
+    per = {}
+    for line in txt.splitlines():
+        m = re.match(r"^\s*(\d+)\s+#\d+\s*\|(.*)", line)
+        if not m: continue
+        cols = [c.split() for c in m[2].split("|")]
+        try:
+            per[int(m[1])] = {"irq_max": int(cols[0][3]), "thread_max": int(cols[1][3])}
+        except (IndexError, ValueError):
+            pass
+    if not per:
+        return None
+    return {c: {"irq_max_us": max((per[i]["irq_max"] for i in cpus if i in per), default=None),
+                "thread_max_us": max((per[i]["thread_max"] for i in cpus if i in per), default=None)} for c, cpus in classes.items()}
+
+
+def parse_turbostat(d):
+    lines = rd(f"{d}/turbostat.txt").splitlines()
+    hdr = next((l.split("\t") for l in lines if l.startswith("Core")), None)
+    rows = [l.split("\t") for l in lines if l.startswith("-\t")]
+    if not hdr or not rows:
+        return None
+    return {k: v for k, v in zip(hdr, rows[-1]) if k in ("Busy%", "Bzy_MHz", "CPU%c6", "CPU%c7", "PkgTmp", "PkgWatt")}
+
+
+# ====================================================================== sweep
+def sweep(sizes, hold, card, rate, emit):
+    res = []
+    for q in sizes:
+        setmeta("clock.force-quantum", q); time.sleep(3)
+        a = pw_top(); time.sleep(hold); b = pw_top()
+        iface = {n: r for n, r in b.items() if card and card in n and r["state"] == "R"}
+        drv_q = max((r["quant"] for r in iface.values()), default=None)
+        per = {n: r["err"] - a.get(n, {}).get("err", r["err"]) for n, r in b.items()}
+        bad = {n: v for n, v in per.items() if v > 0}
+        r = {"quantum": q, "block_ms": round(q / rate * 1000, 2), "seconds": hold, "interface_quant": drv_q,
+             "valid": drv_q == q, "xruns": sum(bad.values()), "xruns_by_node": bad,
+             "interface_busy_over_quantum": max((x["bq"] for x in iface.values()), default=None)}
+        res.append(r); emit(f"    quantum {q:5} ({r['block_ms']:5} ms): xruns {r['xruns']:3}  driver ran at {drv_q}{'' if r['valid'] else '  INVALID'}")
+    return res
+
+
+def daw_phase(secs):
+    a = pw_top(); time.sleep(secs); b = pw_top()
+    per = {n: r["err"] - a.get(n, {}).get("err", r["err"]) for n, r in b.items()}
+    return {"seconds": secs, "quantum": max((r["quant"] for r in b.values() if r["state"] == "R"), default=None),
+            "xruns": sum(v for v in per.values() if v > 0), "xruns_by_node": {n: v for n, v in per.items() if v > 0}}
+
+
+# ====================================================================== report
+def watch_seed(phases):
+    """Starting thresholds for omarchy-audio-watch (W11), from what this machine measured."""
+    seed = {}
+    for name, ph in phases.items():
+        clean = [s["quantum"] for s in ph.get("sweep") or [] if s["valid"] and s["xruns"] == 0]
+        worst = max((v["max_us"] for v in (ph.get("cyclictest", {}).get("nohold") or {}).values()), default=None)
+        seed[name] = {"smallest_clean_quantum": min(clean) if clean else None, "sched_worst_us": worst}
+    return {"per_load": seed,
+            "note": "Seeds, not rules: the watcher should alert on xruns at the session's quantum, and on scheduling latency or temperature beyond what this baseline measured."}
+
+
+def render(rep, path):
+    e = lambda x: html.escape(str(x))
+    phases = rep["phases"]
+    def ct_rows(ph):
+        out = ""
+        for hold in ("nohold", "hold"):
+            c = (ph.get("cyclictest") or {}).get(hold)
+            if not c: continue
+            for cls, v in c.items():
+                out += f"<tr><td>{hold.replace('nohold','no hold')}</td><td>{e(cls)}</td><td><b>{v['max_us']} µs</b></td><td>{v['over_100']} / {v['over_500']} / {v['over_1000']}</td></tr>"
+        return out or "<tr><td colspan=4>skipped</td></tr>"
+    def tl_rows(ph):
+        out = ""
+        for hold in ("nohold", "hold"):
+            t = (ph.get("timerlat") or {}).get(hold)
+            if not t: continue
+            for cls, v in t.items():
+                out += f"<tr><td>{hold.replace('nohold','no hold')}</td><td>{e(cls)}</td><td>{v['irq_max_us']} µs</td><td><b>{v['thread_max_us']} µs</b></td></tr>"
+        return out or "<tr><td colspan=4>skipped</td></tr>"
+    def sw_rows(ph):
+        if ph.get("sweep_skipped"): return f"<tr><td colspan=5>{e(ph['sweep_skipped'])}</td></tr>"
+        return "".join(f"<tr class='{'bad' if s['xruns'] else ''}'><td><b>{s['quantum']}</b></td><td>{s['block_ms']} ms</td><td>{s['xruns']}</td>"
+                       f"<td>{s['interface_quant']}{'' if s['valid'] else ' <span class=inv>INVALID</span>'}</td><td>{e(s['interface_busy_over_quantum'])}</td></tr>" for s in ph.get("sweep") or [])
+    cards = ""
+    for name, ph in phases.items():
+        seed = rep["watch_seed"]["per_load"].get(name, {})
+        c0, c1 = ph.get("context_start", {}), ph.get("context_end", {})
+        thr = (c1.get("throttle_ms") or 0) - (c0.get("throttle_ms") or 0) if c1.get("throttle_ms") is not None and c0.get("throttle_ms") is not None else "?"
+        cards += f"""<section class="phase"><h2>{e(name)} <small>{e(ph.get('load_label',''))}</small></h2>
+<div class="kpis"><div class="kpi"><b>{seed.get('smallest_clean_quantum') or '–'}</b><span>smallest clean buffer (frames)</span></div>
+<div class="kpi"><b>{seed.get('sched_worst_us') if seed.get('sched_worst_us') is not None else '–'} µs</b><span>worst scheduling latency (cyclictest, no hold)</span></div>
+<div class="kpi"><b>{e(c0.get('pkg_temp_c'))}→{e(c1.get('pkg_temp_c'))}°C</b><span>package temperature</span></div>
+<div class="kpi"><b>{e(thr)} ms</b><span>thermal throttling during phase</span></div></div>
+<p class="small">load average {e(' '.join(c0.get('loadavg', [])))} → {e(' '.join(c1.get('loadavg', [])))} · top CPU: {e(', '.join(c1.get('top_cpu', [])[:4]))}</p>
+<h3>Buffer sweep (xruns per size)</h3><table><tr><th>quantum</th><th>block</th><th>xruns</th><th>interface ran at</th><th>busy/quantum</th></tr>{sw_rows(ph)}</table>
+<h3>Scheduling latency: cyclictest</h3><table><tr><th>C-state hold</th><th>cores</th><th>worst</th><th>samples &gt;100 / &gt;500 / &gt;1000 µs</th></tr>{ct_rows(ph)}</table>
+<h3>rtla timerlat</h3><table><tr><th>C-state hold</th><th>cores</th><th>IRQ max</th><th>thread max</th></tr>{tl_rows(ph)}</table>
+{('<h3>DAW phase</h3><p>' + e(json.dumps(ph['daw'])) + '</p>') if ph.get('daw') else ''}</section>"""
+    s = rep["snapshot"]
+    warn = "".join(f"<li>{e(w)}</li>" for w in rep["notes"])
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Audit {e(rep['id'])}</title><style>
+:root{{--bg:#12110f;--panel:#1b1916;--panel2:#23201c;--ink:#ece6dc;--dim:#a39a8c;--line:#3a352e;--ok:#7ee0a1;--bad:#ff7a7a;--acc:#ffb86b}}
+@media (prefers-color-scheme: light){{:root{{--bg:#f7f4ee;--panel:#fff;--panel2:#f1ece3;--ink:#1d1b18;--dim:#6b6358;--line:#d8d0c3;--ok:#1e9a52;--bad:#d23c3c;--acc:#c46a12}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15.5px/1.5 system-ui,sans-serif}}
+main{{max-width:1050px;margin:0 auto;padding:26px 16px 70px}}h1{{margin:0 0 4px;font-size:27px}}h2{{margin:36px 0 10px;padding-top:10px;border-top:1px solid var(--line);font-size:21px}}
+h2 small{{font-size:13px;color:var(--dim);font-weight:400;display:block}}h3{{font-size:15px;margin:18px 0 6px;color:var(--acc)}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}}.kpi{{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--acc);border-radius:12px;padding:10px 12px}}
+.kpi b{{display:block;font-size:24px}}.kpi span{{color:var(--dim);font-size:13px}}
+table{{width:100%;border-collapse:collapse;background:var(--panel);border-radius:10px;overflow:hidden;font-size:14.5px}}th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}}
+th{{background:var(--panel2);font-size:12px;text-transform:uppercase;color:var(--dim)}}tr.bad td{{color:var(--bad)}}.inv{{color:var(--bad);font-weight:700}}
+.small{{color:var(--dim);font-size:13.5px}}.notes{{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 16px}}code{{font:13px ui-monospace,monospace}}
+.wrap{{overflow-x:auto}}</style></head><body><main>
+<h1>Audio audit: {e(s['host'])}</h1><p class="small">{e(rep['id'])} · {e(s['cpu_model'])} · kernel {e(s['kernel'])} · interface {e(s['interface'].get('description'))} · took {rep['took_min']} min</p>
+<div class="notes"><b>Read this first</b><ul>{warn}</ul></div>
+{cards}
+<h2>System snapshot</h2><div class="wrap"><table>
+<tr><td>CPU classes</td><td>{e(s['cpu_classes'])}</td></tr><tr><td>governor / EPP</td><td>{e(s['governor'])} / {e(s['epp'])}</td></tr>
+<tr><td>kernel cmdline</td><td><code>{e(s['cmdline'])}</code></td></tr><tr><td>threadirqs</td><td>{e(s['threadirqs'])}</td></tr>
+<tr><td>RT throttling (sched_rt_runtime_us)</td><td>{e(s['rt_runtime_us'])}</td></tr><tr><td>swappiness</td><td>{e(s['swappiness'])}</td></tr>
+<tr><td>PipeWire</td><td>{e(s['pipewire_version'])} {e(s['pipewire_settings'])}</td></tr>
+<tr><td>audio path</td><td>{e(s['interface'])}</td></tr><tr><td>USB audio power</td><td>{e(s['usb_audio_power'])}</td></tr>
+<tr><td>watch seed (for omarchy-audio-watch)</td><td><code>{e(json.dumps(rep['watch_seed']['per_load']))}</code></td></tr>
+</table></div><p class="small">Raw output in <code>raw/</code>, everything in <code>audit.json</code>. Numbers, not verdicts: the audio skill judges them for this machine.</p>
+</main></body></html>"""
+    open(path, "w").write(page)
+
+
+# ====================================================================== main
+def main():
+    if "--root-helper" in ARGS:
+        return root_helper(opt("--root-helper"), opt("--rtla"), opt("--user"))
+    t0 = time.time()
+    quick = "--quick" in ARGS
+    ct_s, tl_s, hold_s = (15, 10, 10) if quick else (40, 30, 30)
+    loads = (opt("--loads") or "idle,stress").split(",")
+    daw = int(opt("--daw")) if opt("--daw") else None
+    label = opt("--label") or ("first-run" if "--first-run" in ARGS else ("quick" if quick else ""))
+    rid = time.strftime("%Y%m%d-%H%M") + (f"-{label}" if label else "")
+    outdir = os.path.join(STATE, "first-run" if "--first-run" in ARGS else rid)
+    if "--first-run" in ARGS and os.path.exists(os.path.join(outdir, "audit.json")):
+        print(f"first-run audit already exists: {outdir}"); return
+    os.makedirs(os.path.join(outdir, "raw"), exist_ok=True)
+    notes = []
+    def emit(m): print(m, flush=True)
+
+    dump = pw_dump()
+    chain = interface_chain(dump)
+    snap = snapshot(chain)
+    orig = settings()
+    rate = int(orig.get("clock.force-rate") or 0) or int(orig.get("clock.rate") or 48000)
+    minq = int(orig.get("clock.min-quantum") or 32)
+    sizes = [int(x) for x in (opt("--sizes") or "1024,256,128,64,32").split(",") if int(x) >= minq]
+    jack = jack_clients(dump)
+    emit(f"audio audit {rid}: interface {chain.get('description')} ({chain.get('hardware_sink')}), rate {rate}, loads {loads}")
+    emit(f"  results: {outdir}")
+    if not chain.get("hardware_sink"):
+        notes.append("No hardware output found behind the default sink: buffer sweep results cannot be validated.")
+    sweep_block = None
+    if jack and not daw:
+        sweep_block = "skipped: JACK client(s) connected (" + ", ".join(jack) + "); a buffer change would kill a DAW engine. Quit the DAW, or use --daw."
+    if daw and not jack:
+        notes.append("--daw given but no JACK client is connected: DAW phase skipped. Start the DAW first (omarchy-studio-bitwig 128).")
+        daw = None
+    if daw:
+        sweep_block = "skipped in DAW mode (sizes are never changed while a DAW is connected)"
+    json.dump(json.loads(run(["audio-doctor", "--json"], timeout=30).stdout or "{}"), open(f"{outdir}/raw/audio-doctor-before.json", "w"), indent=1)
+
+    # ---- state we own, restored on every exit path
+    procs = {}
+    restored = {"done": False}
+    def restore():
+        if restored["done"]: return
+        restored["done"] = True
+        fq, fr = orig.get("clock.force-quantum", "0"), orig.get("clock.force-rate", "0")
+        if not sweep_block:
+            if fq in ("0", ""):
+                setmeta("clock.force-quantum", 1024); time.sleep(1)  # unstick the graph before releasing (M2 gotcha 1)
+            setmeta("clock.force-quantum", fq or 0)
+        setmeta("clock.force-rate", fr or 0)
+        for name in ("stress", "silence"):
+            p = procs.pop(name, None)
+            if p and p.poll() is None:
+                p.terminate()
+                try: p.wait(5)
+                except sp.TimeoutExpired: p.kill()
+        h = procs.pop("helper", None)
+        if h and h.poll() is None:
+            try: h.stdin.write("quit\n"); h.stdin.flush(); h.wait(10)
+            except Exception: h.kill()
+    atexit.register(restore)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(130))
+
+    # ---- graph must RUN for a forced size to apply: our own silent stream to the default sink
+    if chain.get("default_sink") and not sweep_block:
+        procs["silence"] = sp.Popen(["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", str(rate), "--channels", "2",
+                                     "--target", chain["default_sink"], "-"], stdin=open("/dev/zero", "rb"), stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        time.sleep(1)
+
+    # ---- root helper: one approval, only measures
+    helper = None
+    if "--no-root" not in ARGS:
+        rtla = shutil.which("rtla") or ""
+        cmd = ["sudo", "-S", "-k", "-p", "", sys.executable, os.path.realpath(__file__), "--root-helper", outdir,
+               "--rtla", rtla, "--user", os.environ.get("USER", "")]
+        emit("  asking for sudo (one approval; ntfy push or keyring)...")
+        helper = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True, bufsize=1)
+        pw = ""
+        if opt("--sudo") == "keyring":
+            pw = run(["secret-tool", "lookup", "application", "codex", "purpose", "sudo", "account", os.environ.get("USER", "")]).stdout.strip()
+        helper.stdin.write(pw + "\n"); helper.stdin.flush(); pw = None
+        line = helper.stdout.readline()
+        if line.strip() != "READY":
+            notes.append("Root latency probes skipped: sudo was not approved (" + (helper.stderr.read()[:200].strip() if helper.poll() is not None else "no answer") + ").")
+            helper.kill(); helper = None
+        else:
+            procs["helper"] = helper
+            emit("  root helper ready")
+    else:
+        notes.append("Root latency probes skipped (--no-root).")
+
+    phases = {}
+    try:
+        for load in loads:
+            ph = {"load_label": "the box as it is right now" if load == "idle" else STRESS_LABEL}
+            emit(f"  [{load}]")
+            if load == "stress":
+                if not shutil.which("stress-ng"):
+                    ph["skipped"] = "stress-ng not installed"; phases[load] = ph; continue
+                procs["stress"] = sp.Popen(STRESS + ["--timeout", "1800"], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                time.sleep(10)
+            ph["context_start"] = context()
+            emit(f"    load {' '.join(ph['context_start']['loadavg'])}, package {ph['context_start']['pkg_temp_c']}°C")
+            if helper:
+                helper.stdin.write(f"probe {load} {ct_s} {tl_s}\n"); helper.stdin.flush()
+                emit(f"    latency probes ({2 * ct_s + 2 * tl_s + 10} s)...")
+                while True:
+                    l = helper.stdout.readline()
+                    if not l or l.startswith("DONE"): break
+                d = os.path.join(outdir, "raw", load)
+                ph["cyclictest"] = {h: parse_cyclictest(d, h, cpu_classes()) for h in ("nohold", "hold")}
+                ph["timerlat"] = {h: parse_timerlat(d, h, cpu_classes()) for h in ("nohold", "hold")}
+                ph["turbostat"] = parse_turbostat(d)
+                for h in ("nohold", "hold"):
+                    v = ph["cyclictest"].get(h)
+                    if v: emit(f"    cyclictest {h}: " + ", ".join(f"{c} worst {x['max_us']} µs" for c, x in v.items()))
+            if sweep_block:
+                ph["sweep_skipped"] = sweep_block
+            else:
+                emit(f"    buffer sweep {sizes} ({hold_s} s each)...")
+                ph["sweep"] = sweep(sizes, hold_s, chain.get("card"), rate, emit)
+                setmeta("clock.force-quantum", orig.get("clock.force-quantum") or 1024); time.sleep(1)
+            if daw:
+                emit(f"    DAW phase ({daw} s at the current size)...")
+                ph["daw"] = daw_phase(daw)
+            ph["context_end"] = context()
+            if load == "stress":
+                p = procs.pop("stress", None)
+                if p: p.terminate(); p.wait(10)
+            phases[load] = ph
+    finally:
+        restore()
+
+    after = json.loads(run(["audio-doctor", "--json"], timeout=30).stdout or "{}")
+    json.dump(after, open(f"{outdir}/raw/audio-doctor-after.json", "w"), indent=1)
+    breaks = [f["message"] for f in after.get("findings", []) if f.get("severity") == "BREAK"]
+    if breaks:
+        notes.append("audio-doctor found a BREAK after the run: " + "; ".join(breaks))
+    now = settings()
+    if now.get("clock.force-quantum") != orig.get("clock.force-quantum") or now.get("clock.force-rate") != orig.get("clock.force-rate"):
+        notes.append(f"PipeWire settings NOT restored: found {orig.get('clock.force-quantum')}/{orig.get('clock.force-rate')}, now {now.get('clock.force-quantum')}/{now.get('clock.force-rate')}")
+    notes.append("The buffer sweep plays silence with no DSP load: it shows the interface wakes on time at each size, not that a full project will run there. The DAW phase covers that.")
+    if "stress" in loads:
+        notes.append("'stress' is a fixed synthetic recipe for comparable runs, not real agent load.")
+    rep = {"id": rid, "took_min": round((time.time() - t0) / 60, 1), "args": ARGS, "snapshot": snap,
+           "found_settings": {k: orig.get(k) for k in ("clock.force-quantum", "clock.force-rate", "clock.quantum", "clock.min-quantum")},
+           "phases": phases, "notes": notes}
+    rep["watch_seed"] = watch_seed(phases)
+    json.dump(rep, open(f"{outdir}/audit.json", "w"), indent=1, default=str)
+    render(rep, f"{outdir}/report.html")
+    emit(f"done in {rep['took_min']} min: {outdir}/report.html")
+    for n in notes: emit("  note: " + n)
+
+
+if __name__ == "__main__":
+    main()
