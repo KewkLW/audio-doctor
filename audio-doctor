@@ -240,7 +240,11 @@ def main():
         if media.endswith(" output") and p.get("node.name", "").endswith(".out"):
             continue
         if APP and APP not in app.lower() and APP not in media.lower():
-            continue
+            # also match the real app name (a Discord web app's stream is named "Chromium")
+            wt.join()
+            own = wbox["ctx"].owner(int(p["application.process.id"])) if str(p.get("application.process.id", "")).isdigit() else None
+            if not own or APP not in (own["label"] or "").lower():
+                continue
         nid = int(p.get("object.id", -1))
         sink_name = next((n for n, s in sinks.items() if s["index"] == si.get("sink")), None)
         ch = si.get("channel_map", "").count(",") + 1 if si.get("channel_map") else 2

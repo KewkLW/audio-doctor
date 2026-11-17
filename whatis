@@ -243,6 +243,19 @@ def scope_of(cg):
 
 
 # ------------------------------------------------------------------ identification
+def is_terminal(p, win=None):
+    return p.comm in TERMINALS or ((win or {}).get("class") or "").lower() in TERMINALS
+
+def wine_prefix_of(p):
+    e = p.env
+    if e.get("WINEPREFIX"): return e["WINEPREFIX"].rstrip("/")
+    if e.get("STEAM_COMPAT_DATA_PATH"): return os.path.join(e["STEAM_COMPAT_DATA_PATH"], "pfx")
+    return os.path.join(HOME, ".wine")
+
+def wine_exe_base(cmd):
+    m = re.search(r"([^\\/]+\.exe)", cmd, re.I)
+    return m.group(1).lower() if m else None
+
 def top_of_app(p, cache):
     """Walk up from a helper (chromium --type=..., electron renderer, wine child) to the app's
     main process: stop at the first parent with a different exe family."""
@@ -332,8 +345,8 @@ def identify(pid, win=None, pwc=None, kids=None, pw_since=None, _cache=None):
             name = didx.get(cls.lower()) or didx.get("exec:" + exe_base.lower()) or (cls or os.path.basename(exe_dir)).split(".")[-1]
         elif INTERPRETERS.match(exe_base.split(".")[0] if exe_base else comm) or INTERPRETERS.match(re.sub(r"[\d.]+$", "", exe_base)):
             runtime = "interpreter-script"
-            script = next((a for a in p.argv[1:] if not a.startswith("-") and ("/" in a or "." in a)), None)
-            name = os.path.basename(script) if script else comm
+            script = None if "-c" in p.argv[1:3] else next((a for a in p.argv[1:] if not a.startswith("-") and ("/" in a or "." in a) and " " not in a), None)
+            name = os.path.basename(script) if script else f"{comm} -c" if "-c" in p.argv[1:3] else comm
             ev.append(f"{exe_base} running {script or '(inline)'}")
             if script: extra["script"] = script
 
@@ -356,10 +369,12 @@ def identify(pid, win=None, pwc=None, kids=None, pw_since=None, _cache=None):
         ev.append(f"started from Claude session {env['CLAUDE_CODE_SESSION_ID']}")
 
     # ---- PipeWire client: this pid or any descendant; for wine also siblings in the same prefix
-    group = [p.pid] + descendants(p.pid, kids)
+    # a terminal's descendants are other apps (shells, agents, players): never count them
+    group = [p.pid] if is_terminal(p, win) else [p.pid] + descendants(p.pid, kids)
     if runtime == "wine-proton":
+        pre = wine_prefix_of(p)
         for q in kids.get(p.ppid, []):
-            if q not in group and "wine" in P(q).exe and P(q).env.get("WINEPREFIX", extra.get("wine_prefix")) == env.get("WINEPREFIX", extra.get("wine_prefix")):
+            if q not in group and "wine" in P(q).exe and wine_prefix_of(P(q)) == pre:
                 group.append(q); group += descendants(q, kids)
     client_pids = [q for q in group if q in pwc]
     audio_libs = sorted({lib for q in group for lib in P(q).maps_audio})
@@ -434,11 +449,25 @@ class Context:
             return self.cache[x]
         p = P(int(pid))
         if not p.alive: return None
-        # nearest ancestor (or self) that owns a window wins: that is the app the user sees
+        # nearest ancestor (or self) that owns a window wins: that is the app the user sees.
+        # A terminal is a boundary: mpv / pw-play started from a shell is its own app, not "Foot".
         cur, hops = p, 0
         while cur and cur.pid > 1 and hops < 15:
-            if cur.pid in self.win_by_pid: return self.ident(cur.pid)
+            w = self.win_by_pid.get(cur.pid)
+            if w:
+                if is_terminal(cur, w): break
+                return self.ident(cur.pid)
             cur = P(cur.ppid) if cur.ppid > 1 else None; hops += 1
+        # Wine/Proton helpers (renderers, Agent.exe) are SIBLINGS of the windowed exe under
+        # pv-adverb / wineserver's parent, not its descendants: pick the windowed wine sibling.
+        if "wine" in p.exe:
+            prefix = wine_prefix_of(p)
+            mine = wine_exe_base(p.cmdline)
+            sibs = [q for q in self.kids.get(p.ppid, []) if q in self.win_by_pid and q != p.pid
+                    and "wine" in P(q).exe and wine_prefix_of(P(q)) == prefix]
+            same = [q for q in sibs if wine_exe_base(P(q).cmdline) == mine]
+            if same or len(sibs) == 1:
+                return self.ident((same or sibs)[0])
         return self.ident(top_of_app(p, P).pid)
 
 SYSTEM_CLIENTS = re.compile(r"^(pipewire|wireplumber|pw-dump|pw-record|pw-cat|pw-play|pw-link|pactl|xdg-desktop-por.*|pipewire-pulse)$")

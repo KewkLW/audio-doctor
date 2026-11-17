@@ -24,9 +24,10 @@ whatis --audio       # every window app + every PipeWire client
 whatis --json ...    # for scripting
 ```
 Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-proton (WINEPREFIX / STEAM_COMPAT_DATA_PATH / default ~/.wine, PROTONPATH, SteamAppId -> appmanifest), appimage (APPIMAGE env, or the AppRun + .desktop AppDir layout when env was reset), flatpak, interpreter-script. Tauri/WebKitGTK apps show as native with a "WebKitGTK webview" evidence line, named from the window title.
+- Stream owners: helper pids resolve to the windowed app (chromium/electron children, Wine siblings in the same prefix); a terminal window is a boundary, so mpv started from a shell is "mpv", not "Foot".
 - `launcher scope` is only where the app was started from, never the app's boundary: an app opened from a URI handler sits in the browser's old scope, an installer started by an agent sits in that agent's terminal scope. The `note:` line says which.
 - `agent_session`: the CLAUDE_CODE_SESSION_ID in the process env, i.e. the Claude session that launched it. Read that session's JSONL under ~/.claude/projects/.
-- `pipewire client`: this pid, a descendant, or (for Wine) a sibling in the same prefix holds a PipeWire Client (matched on `application.process.id`; `pipewire.sec.pid` is pipewire-pulse for pulse clients).
+- `pipewire client`: this pid, a descendant (not for terminals: their children are other apps), or (for Wine) a sibling in the same prefix holds a PipeWire Client (matched on `application.process.id`; `pipewire.sec.pid` is pipewire-pulse for pulse clients).
 - `audio evidence`: libpulse / libpipewire / libjack / libopenal / libportaudio / winepulse / winealsa mapped anywhere in the process tree. libasound alone does NOT count (Electron links it without playing).
 - `stale` = started before pipewire-pulse's ActiveEnterTimestamp (wall clock) AND no PipeWire client. audio-doctor only reports stale apps that also have audio evidence, as one line:
   `opened before the PipeWire restart (17:02), no audio connection: Discord (web app), Battle.net (wine)`.
