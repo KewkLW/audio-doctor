@@ -123,9 +123,23 @@ def pw_dump():
         return []
 
 
+DAW_BINARIES = re.compile(r"bitwig|reaper|ardour|zrythm|carla|qtractor|renoise|lmms|bespoke|ableton|live\.exe|fl64\.exe|studio one|cubase", re.I)
+
+
 def jack_clients(dump):
-    return sorted({(o.get("info") or {}).get("props", {}).get("node.name", "?") for o in dump
-                   if o.get("type", "").endswith("Node") and (o.get("info") or {}).get("props", {}).get("client.api") == "jack"})
+    """Clients a buffer-size change could break: every JACK client, plus DAWs on the native PipeWire
+    backend (found 2026-11-17: Bitwig on its PipeWire backend is an Audio/Duplex node with no client.api,
+    so a JACK-only check missed it)."""
+    clients = {o["id"]: (o.get("info") or {}).get("props", {}) for o in dump if o.get("type", "").endswith("Client")}
+    out = set()
+    for o in dump:
+        if not o.get("type", "").endswith("Node"): continue
+        p = (o.get("info") or {}).get("props", {})
+        cl = clients.get(p.get("client.id"), {})
+        who = " ".join(str(x) for x in (p.get("node.name"), cl.get("application.name"), cl.get("application.process.binary")) if x)
+        if p.get("client.api") == "jack" or DAW_BINARIES.search(who) or (p.get("media.class") == "Audio/Duplex" and cl):
+            out.add(p.get("node.name") or cl.get("application.name") or "?")
+    return sorted(out)
 
 
 def interface_chain(dump):
@@ -436,9 +450,9 @@ def main():
         notes.append("No hardware output found behind the default sink: buffer sweep results cannot be validated.")
     sweep_block = None
     if jack and not daw:
-        sweep_block = "skipped: JACK client(s) connected (" + ", ".join(jack) + "); a buffer change would kill a DAW engine. Quit the DAW, or use --daw."
+        sweep_block = "skipped: DAW/JACK client(s) connected (" + ", ".join(jack) + "); a buffer change would kill a DAW engine. Quit the DAW, or use --daw."
     if daw and not jack:
-        notes.append("--daw given but no JACK client is connected: DAW phase skipped. Start the DAW first (omarchy-studio-bitwig 128).")
+        notes.append("--daw given but no DAW or JACK client is connected: DAW phase skipped. Start the DAW first (omarchy-studio-bitwig 128).")
         daw = None
     if daw:
         sweep_block = "skipped in DAW mode (sizes are never changed while a DAW is connected)"
