@@ -343,6 +343,14 @@ def identify(pid, win=None, pwc=None, kids=None, pw_since=None, _cache=None):
             asar = re.search(r"(\S+/app\.asar)", cmd)
             ev.append("electron: " + (asar.group(1) if asar else os.path.join(exe_dir, "resources/app.asar")))
             name = didx.get(cls.lower()) or didx.get("exec:" + exe_base.lower()) or (cls or os.path.basename(exe_dir)).split(".")[-1]
+        elif exe_base == "java" or re.search(r"/(jre|jvm|jdk)[^/]*/bin/java$", exe):
+            # JVM apps (Bitwig ships its own JRE): name from the window class / desktop file, not the jar
+            runtime = "java"
+            jar = next((a for a in p.argv[1:] if a.endswith(".jar")), None)
+            app_dir = re.match(r"^(/opt/[^/]+|/usr/(?:lib|share)/[^/]+)", exe)
+            name = (didx.get(cls.lower()) if cls else None) or (title.split(" - ")[0] if title and cls else None) \
+                or (os.path.basename(app_dir.group(1)) if app_dir else None) or (os.path.basename(jar) if jar else "java")
+            ev.append(f"JVM {exe}" + (f" -jar {jar}" if jar else ""))
         elif INTERPRETERS.match(exe_base.split(".")[0] if exe_base else comm) or INTERPRETERS.match(re.sub(r"[\d.]+$", "", exe_base)):
             runtime = "interpreter-script"
             script = None if "-c" in p.argv[1:3] else next((a for a in p.argv[1:] if not a.startswith("-") and ("/" in a or "." in a) and " " not in a), None)
@@ -422,7 +430,7 @@ def scope_explain(sc, name, cls, exe, comm, cg):
     return f"started by {l}: it inherited {l}'s launch scope, it is not part of {l}"
 
 RT_TAG = {"chromium-webapp": "web app", "wine-proton": "wine", "appimage": "AppImage", "flatpak": "flatpak",
-          "electron": "electron", "interpreter-script": "script"}
+          "electron": "electron", "interpreter-script": "script", "java": "java"}
 def label_for(name, runtime):
     t = RT_TAG.get(runtime)
     return f"{name} ({t})" if t else name

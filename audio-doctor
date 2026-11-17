@@ -253,6 +253,29 @@ def main():
                         "corked": si.get("corked"), "channels": min(ch, 8),
                         "linked_to": [nodes.get(d, {}).get("props", {}).get("node.name") for d in downstream(nid, links)]})
 
+    # JACK and native clients are invisible to the Pulse door (pactl): read them from the graph.
+    # (Found 2026-11-16: Bitwig on JACK did not appear at all.)
+    clients = {o["id"]: (o.get("info") or {}).get("props", {}) for o in dump if o.get("type", "").endswith("Client")}
+    out_ports = {}
+    for o in dump:
+        if o.get("type", "").endswith("Port"):
+            pp = (o.get("info") or {}).get("props", {})
+            if pp.get("port.direction") == "out" and not pp.get("port.monitor"):
+                out_ports[pp.get("node.id")] = out_ports.get(pp.get("node.id"), 0) + 1
+    seen = {st["node"] for st in streams}
+    for nid, n in nodes.items():
+        p = n.get("props", {})
+        if nid in seen or p.get("client.api") != "jack" or not out_ports.get(nid):
+            continue
+        cl = clients.get(p.get("client.id"), {})
+        name = p.get("node.name") or cl.get("application.name") or "?"
+        if APP and APP not in name.lower() and APP not in str(cl.get("application.name", "")).lower():
+            continue
+        linked = [nodes.get(d, {}).get("props", {}).get("node.name") for d in downstream(nid, links)]
+        streams.append({"node": nid, "app": name, "media": "JACK client", "pid": cl.get("application.process.id"),
+                        "sink": next((x for x in linked if x in sinks), None), "mute": False, "volume_pct": None,
+                        "corked": False, "channels": min(out_ports[nid], 8), "linked_to": linked, "api": "jack"})
+
     # which sinks to meter: running ones + every sink a stream points at + default
     want_sinks = {s["sink"] for s in streams if s["sink"]} | {def_sink}
     for n, s in sinks.items():
@@ -316,7 +339,7 @@ def main():
         if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
         elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
         if not s["linked_to"]: find("BREAK", "routing", f"{tag} is not linked to any sink")
-        elif s["sink"] and s["sink"] != def_sink: find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
+        elif s["sink"] and s["sink"] != def_sink and s.get("api") != "jack": find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
         if s["corked"]: find("INFO", "stream", f"{tag} is paused (corked) by the app")
         elif silent(s["level"]):
             st = whatis.Proc(int(s["pid"])).start if str(s.get("pid") or "").isdigit() else None
@@ -372,7 +395,7 @@ def main():
               + (f"\n      -> feeds {', '.join(s['feeds_hardware'])}" if s["feeds_hardware"] else ""))
     print("\napp streams (measured):")
     for s in streams:
-        print(f"  {s['label'][:22]:22} {s['media'][:30]:30} -> {str(s['sink'])[:30]:30} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}{' PAUSED' if s['corked'] else ''}  level {fmt_db(s['level'])}")
+        print(f"  {s['label'][:22]:22} {s['media'][:30]:30} -> {str(s['sink'])[:30]:30} {('vol ' + str(s['volume_pct']) + '%') if s['volume_pct'] is not None else 'jack  '}{' MUTED' if s['mute'] else ''}{' PAUSED' if s['corked'] else ''}  level {fmt_db(s['level'])}")
     if not streams: print("  (none)")
     shown = [a for a in apps if a["audio_capable"] or a["pw_client"]]
     print(f"\napps that can make sound (whatis; {len(apps) - len(shown)} other windows without audio evidence not shown):")
