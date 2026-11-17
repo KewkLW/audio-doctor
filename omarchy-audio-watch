@@ -152,7 +152,7 @@ def cmd_report(out, since):
             tab += f"<tr><td>{e(names[i])}</td><td>{act}</td><td>{len(rows)}</td>" + "".join(f"<td>{'%s / %s' % stat(rows, k)}</td>" for _, k in metrics) + "</tr>"
     xid = [x for s in S for x in s.get("xid") or []]
     cost = round(sum(s.get("self_cpu_s", 0) for s in S) / len(S), 3)
-    locked = [s for s in S if (s.get("gpu") or {}).get("pstate") == "P0" and s["activity"] == "idle"]
+    locked = [s for s in S if ((s.get("gpu") or {}).get("clock") or 0) >= 1500 and s["activity"] == "idle"]
     charts = "".join([svg(S, E, lambda s: (s.get("gpu") or {}).get("power_w"), "GPU power", "W", "#ff9b6b"),
                       svg(S, E, lambda s: (s.get("gpu") or {}).get("temp"), "GPU temperature", "°C", "#ff7a7a"),
                       svg(S, E, lambda s: (s.get("gpu") or {}).get("clock"), "GPU clock", "MHz", "#7fb4ff"),
@@ -173,7 +173,7 @@ th,td{{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white
 .box{{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 14px}}</style></head><body><main>
 <h1>Audio watch: GPU lock + NVMe cap over time</h1>
 <p class=small>{len(S)} samples, {e(S[0]['ts'])} → {e(S[-1]['ts'])}. Dashed lines = events. Compare rows with the same activity only (idle vs idle).</p>
-<div class=box><b>Negatives watched:</b> GPU idle power, temperature and fan (noise) · CPU temperature and throttling (the CPU is this machine's limit; GPU heat shares the case) · NVMe temperatures (capped drives stay awake) · xruns · kernel GPU errors (Xid; the 4090 runs the tensor unlock). <b>Xid lines:</b> {len(xid)} · <b>idle samples with the GPU in P0:</b> {len(locked)} · <b>monitor cost:</b> {cost} CPU-s per sample.</div>
+<div class=box><b>Negatives watched:</b> GPU idle power, temperature and fan (noise) · CPU temperature and throttling (the CPU is this machine's limit; GPU heat shares the case) · NVMe temperatures (capped drives stay awake) · xruns · kernel GPU errors (Xid; the 4090 runs the tensor unlock). <b>Xid lines:</b> {len(xid)} · <b>idle samples with the GPU clock held high (lock holding):</b> {len(locked)} · <b>monitor cost:</b> {cost} CPU-s per sample.</div>
 <h2>By period and activity</h2><div class=wrap><table>{tab}</table></div>
 <h2>Over time</h2>{charts}
 {('<h2>Xid</h2><pre>' + e(chr(10).join(xid[-20:])) + '</pre>') if xid else ''}
