@@ -141,13 +141,19 @@ may_write() {   # 0 when DST is free, unchanged from an earlier run of this inst
 
 # Each returns 1 when DST was not placed; a real failure goes to FAILED, a file we must not touch to SKIPPED.
 put_file() {   # put_file SRC DST MODE
-  local src=$1 dst=$2 mode=$3 tmp
+  local src=$1 dst=$2 mode=$3 tmp h
   may_write "$dst" || return 1
   mkd "$(dirname "$dst")" || { FAILED+=("$dst (cannot create its directory)"); return 1; }
   tmp=$(mktemp "$(dirname "$dst")/.audio-doctor-install.XXXXXX") || { FAILED+=("$dst (cannot create a temp file)"); return 1; }
-  cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; FAILED+=("$dst (copy failed)"); return 1; }
-  PH[$dst]=$(sha256sum "$dst" | cut -d' ' -f1)
-  rec f "$dst" "${PH[$dst]}"
+  PENDING=$tmp   # an interrupt before the mv removes the temp file (on_interrupt)
+  cp "$src" "$tmp" && chmod "$mode" "$tmp" || { rm -f "$tmp"; PENDING=; FAILED+=("$dst (copy failed)"); return 1; }
+  h=$(sha256sum "$tmp" | cut -d' ' -f1)
+  # Recorded before the mv: an interrupt in between leaves a manifest line whose hash matches nothing on
+  # disk, which uninstall.sh treats as "not ours" and leaves alone. Never the other way round.
+  rec f "$dst" "$h"
+  mv -f "$tmp" "$dst" || { rm -f "$tmp"; PENDING=; FAILED+=("$dst (copy failed)"); return 1; }
+  PENDING=
+  PH[$dst]=$h
   PLACED+=("$dst")
 }
 
@@ -155,8 +161,8 @@ put_link() {   # put_link TARGET DST
   local tgt=$1 dst=$2
   may_write "$dst" || return 1
   mkd "$(dirname "$dst")" || { FAILED+=("$dst (cannot create its directory)"); return 1; }
+  rec l "$dst" "$tgt"   # before the link, for the same reason as in put_file
   rm -f "$dst" && ln -s "$tgt" "$dst" || { FAILED+=("$dst (link failed)"); return 1; }
-  rec l "$dst" "$tgt"
   PLACED+=("$dst -> $tgt")
 }
 
@@ -179,16 +185,60 @@ echo
 # here (same name and contents Python would use) puts it in the manifest; Python then reads it as is.
 # A cache file that is already there and not ours is left alone (not an error: Python reuses it).
 put_pyc() {   # put_pyc DST
-  local dst=$1 pyc
+  local dst=$1 pyc tmp
   head -1 "$dst" | grep -q python3 || return 0
   pyc=$(python3 -I -c 'import importlib.util,sys; print(importlib.util.cache_from_source(sys.argv[1]))' "$dst" 2>/dev/null) || return 0
   if [ -e "$pyc" ] || [ -L "$pyc" ]; then still_ours "$pyc" || return 0; fi
   mkd "$(dirname "$pyc")" || { FAILED+=("$pyc (cannot create its directory)"); return 1; }
-  python3 -I -c 'import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)' "$dst" "$pyc" \
-    || { rm -f "$pyc"; FAILED+=("$pyc (bytecode compile failed)"); return 1; }
-  rec f "$pyc" "$(sha256sum "$pyc" | cut -d' ' -f1)"
+  tmp=$(mktemp "$(dirname "$pyc")/.audio-doctor-install.XXXXXX") || { FAILED+=("$pyc (cannot create a temp file)"); return 1; }
+  PENDING=$tmp
+  python3 -I -c 'import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)' "$dst" "$tmp" \
+    || { rm -f "$tmp"; PENDING=; FAILED+=("$pyc (bytecode compile failed)"); return 1; }
+  chmod 0644 "$tmp"
+  rec f "$pyc" "$(sha256sum "$tmp" | cut -d' ' -f1)"
+  mv -f "$tmp" "$pyc" || { rm -f "$tmp"; PENDING=; FAILED+=("$pyc (bytecode write failed)"); return 1; }
+  PENDING=
   PLACED+=("$pyc")
 }
+
+# The manifest location is created and write-tested before anything is placed: if uninstall.sh could
+# not be told what went where, nothing goes anywhere. Directories made for it are removed again on failure.
+manifest_writable() {
+  local t
+  mkd "$KIT_DATA" || return 1
+  [ -d "$KIT_DATA" ] && [ ! -L "$KIT_DATA" ] || return 1
+  if [ -e "$MANIFEST" ] || [ -L "$MANIFEST" ]; then
+    [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] && [ -r "$MANIFEST" ] || return 1
+  fi
+  t=$(mktemp "$KIT_DATA/.install-manifest.XXXXXX" 2>/dev/null) || return 1
+  printf 'probe\n' >"$t" 2>/dev/null || { rm -f "$t"; return 1; }
+  rm -f "$t"
+}
+if ! manifest_writable; then
+  echo "install.sh: FAILED: cannot create or write the manifest in $KIT_DATA (check XDG_DATA_HOME and its permissions)." >&2
+  awk -F'\t' '$1=="d" {print length($2) "\t" $2}' "$NEW" | sort -rn | cut -f2- | while IFS= read -r d; do rmdir "$d" 2>/dev/null; done
+  echo "install.sh: nothing was placed. Exit 1." >&2
+  exit 1
+fi
+
+# The manifest: this run's lines first, then entries from an earlier run that this run did not rewrite
+# (so uninstall still finds them); only this run's b line. Written on success and on an interrupt.
+write_manifest() {
+  local mt
+  mt=$(mktemp "$KIT_DATA/.install-manifest.XXXXXX") || return 1
+  if { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$1 FS $2]=1; next } $1!="b" && !(($1 FS $2) in seen)' "$NEW" "$MANIFEST"; } \
+       | sort -u >"$mt" && chmod 0644 "$mt" && mv -f "$mt" "$MANIFEST"; then return 0; fi
+  rm -f "$mt"; return 1
+}
+PENDING=
+on_interrupt() {
+  trap - INT TERM HUP
+  [ -n "$PENDING" ] && rm -f "$PENDING"
+  if write_manifest; then echo "install.sh: interrupted; what was placed so far is in $MANIFEST (uninstall.sh removes it)" >&2
+  else echo "install.sh: interrupted and the manifest could not be written" >&2; fi
+  exit 130
+}
+trap on_interrupt INT TERM HUP
 
 declare -A CMD_OK=()   # commands this run placed (the unit is started only when its command is one of them)
 for e in "${KIT[@]}"; do
@@ -244,17 +294,12 @@ if [ -d "$SRC/modules" ]; then
 fi
 
 rec b "$BIN"
-# Write the manifest (deduplicated, directories kept from earlier runs).
-mkd "$KIT_DATA" || { echo "install.sh: cannot create $KIT_DATA" >&2; exit 1; }
-# Entries from an earlier run that this run did not rewrite stay, so uninstall still finds them.
-MTMP=$(mktemp "$KIT_DATA/.install-manifest.XXXXXX") || MTMP=
-if [ -z "$MTMP" ] || ! { { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$1 FS $2]=1; next } $1!="b" && !(($1 FS $2) in seen)' "$NEW" "$MANIFEST"; } \
-       | sort -u >"$MTMP" && chmod 0644 "$MTMP" && mv -f "$MTMP" "$MANIFEST"; }; then
-  [ -n "$MTMP" ] && rm -f "$MTMP"
+if ! write_manifest; then
   echo "install.sh: FAILED to write the manifest $MANIFEST; uninstall.sh cannot find what was placed:" >&2
   for p in "${PLACED[@]}"; do echo "  $p" >&2; done
   exit 1
 fi
+trap - INT TERM HUP
 
 echo "Placed:"
 for p in "${PLACED[@]}"; do echo "  $p"; done

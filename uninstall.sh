@@ -34,6 +34,35 @@ if [ ! -f "$MANIFEST" ]; then
   exit 0
 fi
 
+# On a failure or an interrupt the manifest is rewritten to list only what is still on disk, so the next run retries
+# exactly that: f/l lines whose path still exists, d lines whose directory still exists, m lines whose
+# disable hook is still listed, and the b line. A module that disabled fine and was removed drops out,
+# so a retry does not trip over its missing hook.
+rewrite_manifest() {
+  local mt t p x
+  declare -A hook=()
+  mt=$(mktemp "$KIT_DATA/.install-manifest.XXXXXX") || return 1
+  {
+    while IFS=$'\t' read -r t p x; do
+      case $t in
+        b) printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}" ;;
+        f|l|d) if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}"; [ "$t" = f ] && hook[$p]=1; fi ;;
+      esac
+    done <"$MANIFEST"
+    while IFS=$'\t' read -r t p x; do
+      [ "$t" = m ] && [ -n "${hook[$p/disable]+x}" ] && printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}"
+    done <"$MANIFEST"
+  } >"$mt" && chmod 0644 "$mt" && mv -f "$mt" "$MANIFEST" && return 0
+  rm -f "$mt"; return 1
+}
+on_interrupt() {
+  trap - INT TERM HUP
+  if rewrite_manifest; then echo "uninstall.sh: interrupted; $MANIFEST now lists what is still installed, run uninstall.sh again" >&2
+  else echo "uninstall.sh: interrupted; $MANIFEST kept unchanged, run uninstall.sh again" >&2; fi
+  exit 130
+}
+trap on_interrupt INT TERM HUP
+
 # 1. Watch unit: stop and disable it only when systemd's loaded unit is the very file we installed
 #    (a scratch HOME must never stop the real user's service of the same name).
 FAILED=()
@@ -135,13 +164,26 @@ if [ $SD = 1 ]; then systemctl --user daemon-reload || FAILED+=("systemctl --use
 
 # 4. The manifest, then the directories install.sh created, deepest first, only when empty.
 dirs=$(awk -F'\t' '$1=="d" {print length($2) "\t" $2}' "$MANIFEST" | sort -rn | cut -f2-)
-if [ ${#FAILED[@]} -eq 0 ]; then rm -f "$MANIFEST"
-else kept+=("$MANIFEST (kept because something failed; run uninstall.sh again after fixing it)"); fi
-while IFS= read -r d; do
-  [ -n "$d" ] && [ -d "$d" ] || continue
-  under_state "$d" && continue
-  if rmdir "$d" 2>/dev/null; then echo "  removed $d/"; else kept+=("$d/ (not empty)"); fi
-done <<<"$dirs"
+rmdirs() {
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    under_state "$d" && continue
+    if rmdir "$d" 2>/dev/null; then echo "  removed $d/"; else kept+=("$d/ (not empty)"); fi
+  done <<<"$dirs"
+}
+trap - INT TERM HUP
+if [ ${#FAILED[@]} -eq 0 ]; then
+  rm -f "$MANIFEST"
+  rmdirs
+else
+  rmdirs
+  if rewrite_manifest; then
+    kept+=("$MANIFEST (rewritten to list only what is still installed; run uninstall.sh again after fixing the cause)")
+  else
+    kept+=("$MANIFEST (kept unchanged, rewriting it failed; run uninstall.sh again after fixing the cause)")
+  fi
+fi
 
 echo "Removed $removed installed files."
 if [ ${#kept[@]} -gt 0 ]; then

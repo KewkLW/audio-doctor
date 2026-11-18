@@ -9,6 +9,9 @@
 # PATH shim) must give exit 1, never "Done". Module hooks: only ones install.sh placed in that run (at
 # install) or recorded with a matching hash (at uninstall) are executed; a foreign module dir at install,
 # a user-added module dir and a tampered hook at uninstall are never run (proved with marker files).
+# Partial failures: a mixed module result (one disable ok, one failing, then fixed), an unwritable
+# manifest location (nothing placed), and install.sh / uninstall.sh interrupted by SIGTERM part way
+# (manifest lists exactly what is on disk, the next uninstall finishes clean).
 #
 # Plays no audio and opens no stream: audio-doctor runs as `--audit` (config only) and
 # omarchy-audio-audit, which starts a full measured run with a stream on any invocation, is only
@@ -382,6 +385,99 @@ out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
   && [ "$(cd "$H" && find . -mindepth 1 -type f | sort | tr '\n' ' ')" = "$(cd "$H" && find ./.local/share/audio-doctor/modules/useradded -type f | sort | tr '\n' ' ')" ] \
   && ok "after install.sh --force restored the hook: its own disable ran, the user module still not run and is all that is left" \
   || { bad "retry after tamper: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; find "$H" -mindepth 1 -type f; }
+rm -rf "$S"
+
+# (d) Mixed module result: "good" disables fine, "stuck" fails. The first uninstall exits 1 and
+#     rewrites the manifest to what is still on disk (good drops out, stuck stays); after the fault is
+#     fixed the second uninstall finishes clean with exit 0.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; MK=$S/marks; mkdir -p "$H" "$MK"; mk_src "$SRC"
+mk_mod "$SRC/modules/good" good "$MK"
+mkdir -p "$SRC/modules/stuck"
+printf '#!/bin/sh\nexit 0\n' >"$SRC/modules/stuck/detect"
+printf '#!/bin/sh\necho placed\n' >"$SRC/modules/stuck/enable"
+printf '#!/bin/sh\n[ -e "%s/fixed" ] || { echo "simulated fault"; exit 1; }\necho removed\n' "$S" >"$SRC/modules/stuck/disable"
+chmod +x "$SRC/modules/stuck/"*
+MD=$H/.local/share/audio-doctor/modules; M=$H/.local/share/audio-doctor/install-manifest
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 0 ] && grep -qP "^m\t$MD/good\t" "$M" && grep -qP "^m\t$MD/stuck\t" "$M" && ok "mixed modules: both installed, both m lines" || { bad "mixed install: exit $rc"; echo "$out" | tail -8; }
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+echo "$out" | grep -E '^Module|manifest|FAILED' | sed 's/^/    | /'
+stale=$(awk -F'\t' '$1!="b" && $1!="m" && !(system("test -e \"" $2 "\"")==0) {print $2}' "$M" 2>/dev/null)
+[ $rc = 1 ] && [ -e "$MK/good-disable" ] && [ ! -e "$MD/good" ] && [ -x "$MD/stuck/disable" ] && [ -f "$M" ] \
+  && ! grep -q "$MD/good" "$M" && grep -qP "^m\t$MD/stuck\t" "$M" && grep -qP "^f\t$MD/stuck/disable\t" "$M" && [ -z "$stale" ] \
+  && [ ! -e "$H/.local/bin/whatis" ] \
+  && ok "mixed uninstall: exit 1, good removed and dropped from the manifest, stuck kept and listed, manifest lists only what is on disk" \
+  || { bad "mixed uninstall: exit $rc, stale: $stale"; echo "$out" | tail -12; cat "$M"; }
+rm -f "$MK"/*; touch "$S/fixed"
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -q 'Module stuck: disable exit 0' && [ -z "$(ls -A "$MK")" ] && [ -z "$(find "$H" -mindepth 1)" ] \
+  && ok "mixed retry after the fix: exit 0, only stuck's disable ran (good not run again), nothing left" \
+  || { bad "mixed retry: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; find "$H" -mindepth 1; }
+rm -rf "$S"
+
+# (e) The manifest location cannot be written: install.sh places nothing and exits 1.
+#     (1) XDG_DATA_HOME exists but is read-only; (2) XDG_DATA_HOME lies under a regular file.
+for how in readonly underfile; do
+  S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H"
+  if [ $how = readonly ]; then D=$H/ro-data; mkdir -p "$D"; chmod 555 "$D"
+  else D=$H/afile/share; echo x >"$H/afile"; fi
+  PRE=$(cd "$H" && find . | sort)
+  E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$D" PATH="$H/.local/bin:$PATH")
+  out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
+  POST=$(cd "$H" && find . | sort)
+  [ $rc = 1 ] && echo "$out" | grep -q 'nothing was placed' && [ "$PRE" = "$POST" ] \
+    && ok "manifest location not writable ($how): exit 1, nothing placed (HOME tree unchanged)" \
+    || { bad "unwritable manifest ($how): exit $rc"; echo "$out" | tail -6; diff <(echo "$PRE") <(echo "$POST"); }
+  chmod -R u+w "$S"; rm -rf "$S"
+done
+
+# (f) install.sh interrupted mid-placement: a cp shim sends SIGTERM to install.sh on its 3rd call
+#     (deterministic, no timing). The manifest written on the interrupt must list every file that is
+#     on disk, and uninstall.sh must then leave the scratch HOME empty.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/shim"
+cat >"$S/shim/cp" <<EOS
+#!/bin/sh
+n=\$(cat "$S/shim/n" 2>/dev/null || echo 0); n=\$((n + 1)); echo \$n >"$S/shim/n"
+[ \$n -eq 3 ] && kill -TERM \$PPID
+exec /usr/bin/cp "\$@"
+EOS
+chmod +x "$S/shim/cp"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/shim:$H/.local/bin:$PATH")
+out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
+M=$H/.local/share/audio-doctor/install-manifest
+onfs=$(cd / && find "$H" -type f ! -path "$M" | sort)
+inman=$(awk -F'\t' '$1=="f" {print $2}' "$M" 2>/dev/null | sort)
+[ $rc = 130 ] && echo "$out" | grep -q 'interrupted; what was placed so far' && [ -n "$onfs" ] && [ "$onfs" = "$inman" ] \
+  && ok "install interrupted (SIGTERM after 2 copies): exit 130, manifest lists exactly the $(echo "$onfs" | wc -l) files on disk" \
+  || { bad "interrupted install: exit $rc"; echo "$out" | tail -6; diff <(echo "$onfs") <(echo "$inman"); }
+out=$("${E[@]}" "$REPO/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ -z "$(find "$H" -mindepth 1)" ] && ok "uninstall after the interrupted install: exit 0, nothing left" \
+  || { bad "uninstall after interrupt: exit $rc"; echo "$out" | tail -8; find "$H" -mindepth 1; }
+rm -rf "$S"
+
+# (g) uninstall.sh interrupted mid-removal: an rm shim sends SIGTERM to uninstall.sh on its 2nd call.
+#     The manifest is rewritten to what is still on disk; the next uninstall exits 0 and leaves nothing.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; MK=$S/marks; mkdir -p "$H" "$MK" "$S/shim"; mk_src "$SRC"
+mk_mod "$SRC/modules/good" good "$MK"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+"${E[@]}" "$SRC/install.sh" --no-start >/dev/null 2>&1
+cat >"$S/shim/rm" <<EOS
+#!/bin/sh
+n=\$(cat "$S/shim/n" 2>/dev/null || echo 0); n=\$((n + 1)); echo \$n >"$S/shim/n"
+[ \$n -eq 2 ] && kill -TERM \$PPID
+exec /usr/bin/rm "\$@"
+EOS
+chmod +x "$S/shim/rm"
+M=$H/.local/share/audio-doctor/install-manifest
+out=$(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/shim:$H/.local/bin:$PATH" "$SRC/uninstall.sh" 2>&1); rc=$?
+stale=$(while IFS=$'\t' read -r t p x; do case $t in f|l|d) [ -e "$p" ] || [ -L "$p" ] || echo "$p" ;; esac; done <"$M" 2>/dev/null)
+[ $rc = 130 ] && echo "$out" | grep -q 'uninstall.sh: interrupted' && [ -f "$M" ] && [ -z "$stale" ] \
+  && ok "uninstall interrupted (SIGTERM at the 2nd rm): exit 130, manifest rewritten to only what is on disk" \
+  || { bad "interrupted uninstall: exit $rc, stale: $stale"; echo "$out" | tail -6; }
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ -z "$(find "$H" -mindepth 1)" ] && ok "uninstall after the interrupted uninstall: exit 0, nothing left" \
+  || { bad "uninstall after interrupted uninstall: exit $rc"; echo "$out" | tail -8; find "$H" -mindepth 1; }
 rm -rf "$S"
 
 AFTER=$(real_snapshot)
