@@ -14,8 +14,13 @@
 # (manifest lists exactly what is on disk, the next uninstall finishes clean).
 #
 # Plays no audio and opens no stream: audio-doctor runs as `--audit` (config only) and
-# omarchy-audio-audit, which starts a full measured run with a stream on any invocation, is only
-# checked as installed, executable and parsing (Conductor ruling under the audio hold).
+# omarchy-audio-audit only as `--help` and with an unknown flag (both exit before any measuring), with
+# logging stubs for pw-cat, pw-play, pw-metadata, sudo and stress-ng first on PATH that must stay unused.
+# Module files: install.sh runs each module's detect && enable, and what enable places is the module's,
+# recorded in its own manifest, not in the install manifest. The "placed equals manifest" check counts
+# those through the module's status --json (pieces in state placed) plus its module-state/<name>.placed.
+# With the RME on USB the rme-adi2 pieces are placed; to test the RME-absent state on the same machine, put
+# a stub lsusb that exits 1 first on PATH (the module's detect then reports absent).
 # It never calls the real systemctl with a write verb: the scratch unit dir is not on the user
 # manager's path, so install.sh and uninstall.sh leave systemd alone; the --start test uses a shim.
 set -u
@@ -70,9 +75,26 @@ for c in $(seq 1 "$CYCLES"); do
   PLACED=$(echo "$POSTINST" | grep -vxF -f <(echo "$SEED"))
   echo "  placed (every file and link that is new after install.sh, before any command ran):"
   echo "$PLACED" | sed 's/^/    /'
-  RECORDED=$( { awk -F'\t' '$1=="f" || $1=="l" {print $2}' "$M"; echo "$M"; } | sed "s|^$H|.|" | sort)
-  [ "$PLACED" = "$RECORDED" ] && ok "every placed file is in the manifest and every manifest file was placed" \
-    || { bad "placed files and manifest differ:"; diff <(echo "$RECORDED") <(echo "$PLACED") | sed 's/^/      /'; }
+  # Module-owned files, counted by each installed module itself: pieces its status --json reports as placed,
+  # plus its own manifest (module-state/<name>.placed) when it wrote one.
+  MODOWN=""
+  for md in "$H"/.local/share/audio-doctor/modules/*/; do
+    mn=$(basename "$md"); [ -x "$md/status" ] || continue
+    if "${E[@]}" timeout 30 "$md/detect" >/dev/null 2>&1; then dev=present; else dev=absent; fi
+    pj=$("${E[@]}" timeout 30 "$md/status" --json) || { bad "module $mn: status --json failed"; continue; }
+    pp=$(echo "$pj" | python3 -I -c 'import json,sys; [print(p["path"]) for p in json.load(sys.stdin)["pieces"] if p["state"]=="placed"]')
+    mm=$H/.local/share/audio-doctor/module-state/$mn.placed
+    np=$(echo "$pp" | grep -c .)
+    echo "  module $mn: device $dev; its status reports $np piece(s) placed${pp:+: $(echo $pp | sed "s|$H|.|g")}"
+    if [ $dev = absent ]; then
+      [ "$np" = 0 ] && [ ! -e "$mm" ] && ok "module $mn absent: no module pieces placed, no module manifest" \
+        || bad "module $mn absent but it placed: $pp $( [ -e "$mm" ] && echo "$mm")"
+    fi
+    MODOWN=$(printf '%s\n%s\n%s\n' "$MODOWN" "$pp" "$( [ -e "$mm" ] && echo "$mm")")
+  done
+  RECORDED=$( { awk -F'\t' '$1=="f" || $1=="l" {print $2}' "$M"; echo "$M"; echo "$MODOWN"; } | grep -v '^$' | sed "s|^$H|.|" | sort)
+  [ "$PLACED" = "$RECORDED" ] && ok "every placed file is in the install manifest or a module's own manifest, and every one of those was placed" \
+    || { bad "placed files and manifests differ:"; diff <(echo "$RECORDED") <(echo "$PLACED") | sed 's/^/      /'; }
   n=0 missing=0
   while IFS=$'\t' read -r t p x; do n=$((n + 1)); [ -e "$p" ] || { missing=1; bad "manifest entry missing on disk: $p"; }; done <"$M"
   [ $missing = 0 ] && ok "all $n manifest entries exist"
@@ -94,14 +116,33 @@ for c in $(seq 1 "$CYCLES"); do
   run footprint 'compare'
   run config-audit 'config audit: [0-9]+ drop-ins read'
   run audio-doctor 'config audit: [0-9]+ drop-ins read' --audit
-  # omarchy-audio-audit: parse-only by Conductor ruling (criterion 3 exception). It has no --help or
-  # dry mode: any run starts a measured run that opens a playback stream, which the audio hold forbids.
-  # So it is checked as installed, executable and parsing as Python; it is not executed. The missing
-  # --help is a GAP filed as its own bounty.
   if [ -x "$H/.local/bin/omarchy-audio-audit" ] && head -1 "$H/.local/bin/omarchy-audio-audit" | grep -q python3 \
      && "${E[@]}" python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$H/.local/bin/omarchy-audio-audit"; then
-    ok "omarchy-audio-audit installed, executable, parses (not run: every run opens a playback stream; audio hold)"
+    ok "omarchy-audio-audit installed, executable, parses"
   else bad "omarchy-audio-audit missing, not executable or does not parse"; fi
+  # omarchy-audio-audit --help and an unknown flag must exit before any measuring: what a run would start
+  # (playback stream, clock metadata, sudo, stress) is a logging stub first on PATH that must stay unused,
+  # and the audit's state dir must not appear. A full run is never started here.
+  mkdir -p "$S/stub"; : >"$S/stub/called"
+  for t in pw-cat pw-play pw-metadata sudo stress-ng; do
+    printf '#!/bin/sh\necho "%s $*" >>"%s/stub/called"\nexit 1\n' "$t" "$S" >"$S/stub/$t"; chmod +x "$S/stub/$t"
+  done
+  ES=("${E[@]}" PATH="$S/stub:$H/.local/bin:$PATH")
+  AS=$H/.local/state/omarchy-studio/audit
+  for a in -h --help; do
+    o=$("${ES[@]}" timeout 20 "$H/.local/bin/omarchy-audio-audit" "$a" 2>/dev/null); r=$?
+    miss=""; for f in -h --help --quick --no-root --loads --sizes --daw --first-run --sudo --label --no-disk --disk-path --root-helper --rtla --user; do
+      echo "$o" | grep -qE -- "^ +(-h, )?$f[ ,]" || miss="$miss $f"; done
+    [ $r = 0 ] && echo "$o" | grep -q '^usage: omarchy-audio-audit' && [ -z "$miss" ] \
+      && ok "omarchy-audio-audit $a -> exit 0, usage on stdout, one line per flag" || bad "omarchy-audio-audit $a -> exit $r, missing flag lines:${miss:- none}"
+  done
+  o=$("${ES[@]}" timeout 20 "$H/.local/bin/omarchy-audio-audit" --no-such-flag 2>&1 >/dev/null); r=$?
+  so=$("${ES[@]}" timeout 20 "$H/.local/bin/omarchy-audio-audit" --no-such-flag 2>/dev/null)
+  [ $r = 2 ] && [ -z "$so" ] && echo "$o" | grep -q 'unknown argument: --no-such-flag' && echo "$o" | grep -q '^usage: omarchy-audio-audit' \
+    && ok "omarchy-audio-audit --no-such-flag -> exit 2, usage on stderr, nothing on stdout" || bad "omarchy-audio-audit --no-such-flag -> exit $r"
+  [ ! -s "$S/stub/called" ] && ok "omarchy-audio-audit --help / bad flag ran no pw-cat, pw-play, pw-metadata, sudo or stress-ng" \
+    || bad "omarchy-audio-audit --help / bad flag executed: $(cat "$S/stub/called")"
+  [ ! -e "$AS" ] && ok "omarchy-audio-audit --help / bad flag left no audit state dir" || bad "omarchy-audio-audit --help / bad flag created $AS"
 
   # Bytecode next to the commands must all come from install.sh (it is in the manifest).
   stray_pyc=$(find "$H/.local/bin" -path '*/__pycache__/*' -type f | grep -vxF -f <(awk -F'\t' '$1=="f" {print $2}' "$M"))
