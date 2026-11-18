@@ -73,12 +73,22 @@ def rme_present():
 def sweep_gate(chain, rme_on):
     """(sweep_block, note) for the hardware check. The default output waiting for an ADI-2 that is off USB (module
     off) is not a routing fault: the sweep is skipped with no extra note, the run's first line already said why."""
+    # module off: the default output is the ADI-2 itself (a direct ALSA default, waits_for None, which the chain may
+    # still name as hardware_sink) or a loopback waiting for it. Neutral skip, checked before the hardware sink.
+    if not rme_on and any("RME_ADI-2" in str(chain.get(k) or "") for k in ("default_sink", "hardware_sink", "waits_for")):
+        return "skipped (no hardware output now)", None
     if chain.get("hardware_sink"):
         return None, None
-    if not rme_on and "RME_ADI-2" in str(chain.get("waits_for") or ""):
-        return "skipped (no hardware output now)", None
     return ("skipped: no hardware output behind the default sink",
             "No hardware output found behind the default sink (routing broken? run audio-doctor --fix): buffer sweep skipped.")
+
+
+def rme_scrub(chain, rme_on):
+    """Module off and the default output chain is the ADI-2's: the interface rows name no RME target (no hardware
+    output now). Unchanged otherwise."""
+    if rme_on or not any("RME_ADI-2" in str(chain.get(k) or "") for k in ("default_sink", "hardware_sink", "waits_for")):
+        return chain
+    return dict(chain, hardware_sink=None, card=None, waits_for=None, default_sink=None, description="no hardware output now")
 
 
 def rd(path, default=""):
@@ -653,6 +663,8 @@ def main():
 
     dump = pw_dump()
     chain = interface_chain(dump)
+    sweep_block, note = sweep_gate(chain, RME_ON)  # before the scrub: it needs the ADI-2 names to see the module-off case
+    chain = rme_scrub(chain, RME_ON)
     snap = snapshot(chain)
     snap["power"] = power_settings(dump, chain)
     orig = settings()
@@ -662,7 +674,6 @@ def main():
     jack = jack_clients(dump)
     emit(f"audio audit {rid}: interface {chain.get('description')} ({chain.get('hardware_sink')}), rate {rate}, loads {loads}")
     emit(f"  results: {outdir}")
-    sweep_block, note = sweep_gate(chain, RME_ON)
     if note: notes.append(note)
     if jack and not daw:
         sweep_block = "skipped: DAW/JACK client(s) connected (" + ", ".join(jack) + "); a buffer change would kill a DAW engine. Quit the DAW, or use --daw."

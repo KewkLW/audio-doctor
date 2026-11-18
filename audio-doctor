@@ -231,6 +231,8 @@ def main():
         time.sleep(0.5)
     svc = services()
     hw = hardware()
+    if not rme_on:  # detect is the module's switch: no ADI-2 hardware row while it says absent
+        hw["usb_audio"] = [u for u in hw["usb_audio"] if "ADI-2" not in u]
     nodes, links, dump = graph()
     wbox = {}
     def _whatis():
@@ -303,10 +305,16 @@ def main():
                         "sink": next((x for x in linked if x in sinks), None), "mute": False, "volume_pct": None,
                         "corked": False, "channels": min(out_ports[nid], 8), "linked_to": linked, "api": "jack"})
 
+    # RME module off: streams that play into the ADI-2 and its sinks are dropped here, before metering, so they are
+    # never metered, toned, checked or printed (the one neutral module-off line says why)
+    def rme_target(n): return n in rme_off or (not rme_on and confaudit.is_rme(n))
+    if not rme_on:
+        streams = [s for s in streams if not (rme_target(s["sink"]) or any(rme_target(x) for x in s["linked_to"]))]
     # which sinks to meter: running ones + every sink a stream points at + default
     want_sinks = {s["sink"] for s in streams if s["sink"]} | {def_sink}
     for n, s in sinks.items():
         if s.get("state") == "RUNNING": want_sinks.add(n)
+    want_sinks = {n for n in want_sinks if not rme_target(n)}
     # follow virtual sinks to hardware: sink -> its loopback stream -> hw sink
     hops = {}
     for n in list(want_sinks):
@@ -317,6 +325,9 @@ def main():
             out = by_name.get(n + ".out")
             if out:
                 hw_targets = [nodes[d]["props"].get("node.name") for d in downstream(out["id"], links) if d in nodes]
+                if hw_targets and all(rme_target(h) for h in hw_targets):  # a virtual sink that only feeds the ADI-2
+                    rme_off.add(n); want_sinks.discard(n); continue
+                hw_targets = [h for h in hw_targets if not rme_target(h)]
                 hops[n] = hw_targets
                 want_sinks.update(hw_targets)
 
@@ -327,7 +338,7 @@ def main():
             targets.append(("sink:" + n, n, ch, "sink"))
 
     tone_proc = None
-    if TONE and def_sink:
+    if TONE and def_sink and not rme_target(def_sink):  # never a tone into a lingering ADI-2 sink while the module is off
         tf = os.path.join(tempfile.gettempdir(), "audio-doctor-tone.wav")
         if not os.path.exists(tf):
             sp.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=3,volume=-30dB", "-ac", "2", tf])
@@ -353,7 +364,6 @@ def main():
         sink_info[n] = {"desc": s.get("description"), "state": s.get("state"), "mute": s.get("mute"),
                         "volume_pct": vol_pct(s.get("volume", {})), "level": levels.get("sink:" + n),
                         "feeds_hardware": hops.get(n), "default": n == def_sink}
-        if n in rme_off: continue
         if s.get("mute"): find("BREAK", "sink", f"sink '{s.get('description')}' is MUTED", f"pactl set-sink-mute {n} 0")
         v = sink_info[n]["volume_pct"]
         if v is not None and v <= 2: find("BREAK", "sink", f"sink '{s.get('description')}' volume is {v}%", f"pactl set-sink-volume {n} 50%")
@@ -363,8 +373,6 @@ def main():
     # stream verdicts
     pw_since = ctx.since
     for s in streams:
-        if rme_off and (s["sink"] in rme_off or any(x in rme_off or confaudit.is_rme(x) for x in s["linked_to"])):
-            continue  # plays into the ADI-2 while the module is off
         tag = f"{s['label']} [{s['media'][:40]}]"
         if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
         elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
@@ -397,7 +405,7 @@ def main():
         a["has_stream"] = a["pid"] in stream_owners
 
     # tone test
-    if TONE and def_sink not in rme_off:  # a tone into a lingering ADI-2 sink while the module is off proves nothing
+    if TONE and not rme_target(def_sink):
         ok = not silent(sink_info.get(def_sink, {}).get("level"))
         hw_ok = all(not silent(sink_info.get(h, {}).get("level")) for h in (sink_info.get(def_sink, {}).get("feeds_hardware") or [def_sink]))
         if not ok: find("BREAK", "tone", f"test tone did not show up on default sink '{def_sink}'")
@@ -424,7 +432,7 @@ def main():
         print(f"  [{f['severity']:5}] {f['hop']:8} {f['message']}" + (f"\n{'':18}fix: {f['fix']}" if f["fix"] else ""))
     print(f"\nservices: " + ", ".join(f"{k}={v['state']}" for k, v in svc.items()))
     print("hardware: usb audio = " + (", ".join(hw["usb_audio"]) or "none") + " | bt = " + (", ".join(hw["bt_connected"]) or "none"))
-    print(f"default sink: {def_sink}")
+    print(f"default sink: {def_sink if not rme_target(def_sink) else '(not checked)'}")
     print("\nsinks (measured):")
     for n, s in sink_info.items():
         print(f"  {'*' if s['default'] else ' '} {s['desc'][:48]:48} {s['state']:9} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}  level {fmt_db(s['level'])}"

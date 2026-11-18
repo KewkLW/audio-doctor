@@ -105,6 +105,7 @@ def cmd_run(interval):
             for k, v in cur.items():
                 if k in last_pw and v >= last_pw[k]: inc += v - last_pw[k]
             s["xruns"] = inc if last_pw else None; last_pw = cur
+            s["xrun_rme_nodes"] = sum("RME_ADI" in k for k in cur)  # 0 while the RME module is off (detect absent)
         x, cursor = xid_since(cursor)
         s["xid"] = x
         s["self_cpu_s"] = round(time.process_time() - c0, 3)
