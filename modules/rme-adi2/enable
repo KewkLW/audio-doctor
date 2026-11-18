@@ -16,7 +16,7 @@ while IFS='|' read -r name kind src dest; do
     echo "$name: NOT placed: $dest changed since enable placed it: left as it is"; rc=1; continue
   fi
   want=$(render "$kind" "$src") || {
-    echo "$name: NOT placed: cannot read the unit's USB serial (device off USB, or no udev); run enable again with the RME awake"
+    echo "$name: NOT placed: cannot resolve the unit's ALSA node names from udev ID_SERIAL or the PipeWire graph (device off USB?); nothing half-filled written; run enable again with the RME awake"
     rc=1; continue; }
   if [ -e "$dest" ] || [ -L "$dest" ]; then
     if identical "$kind" "$dest" "$want"; then

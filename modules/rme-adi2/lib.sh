@@ -48,7 +48,9 @@ render() {
   case "$kind" in
     file) cat "$src" ;;
     template) s=$(id_serial) || return 1
-              sed "/^#@/d; /target\.object/s|RME_ADI-2_Pro__<serial>__<usb-id>|$s|" "$src" ;;  # #@ lines: template notes only
+              s=$(sed "/^#@/d; /target\.object/s|RME_ADI-2_Pro__<serial>__<usb-id>|$s|" "$src") || return 1  # #@ lines: template notes only
+              case "$s" in *'<serial>'*|*'<usb-id>'*) return 1 ;; esac  # never a half-filled file
+              printf '%s\n' "$s" ;;
     link) echo "$src" ;;
   esac
 }
