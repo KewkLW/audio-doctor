@@ -59,7 +59,7 @@ studio-keepalive status
 | tool | what it does |
 |---|---|
 | `daw-ramp` | Bitwig dropout ramp/bisect through BitwigBridge (opens chunk projects, activates groups, proves play, counts xruns per sample). `m2-bisect.sh` wraps it unattended (mute, keepalive, silent launch, restore). |
-| `power-ab OUT USER [TORCH_PYTHON]` | root, once: runtime-only A/B of NMI watchdog, GPU lock under load, NVMe APST, ASPM; originals saved, reverted, read back |
+| `power-ab OUT USER TORCH_PYTHON` | root, once: runtime-only A/B of NMI watchdog, GPU lock under load, NVMe APST, ASPM; originals saved, reverted, read back |
 | `studio-power-apply OUT USER SERIAL[=LABEL]...` | root, once: NVMe APST cap per audio drive (udev by serial, gated) + `studio-gpu-lock` service |
 | `omarchy-audio-watch` | always-on 30 s monitor (GPU/CPU/NVMe/xruns/Xid, activity-tagged) + `report OUT.html`; `event "text"` marks changes |
 | `footprint NAME` / `compare A B` | memory/CPU/threads before vs after (e.g. DAW loaded) |
@@ -93,7 +93,7 @@ Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-prot
 ## Known failure -> fix
 | Symptom in report | Cause | Fix |
 |---|---|---|
-| stream connected but SILENT + "started BEFORE the last PipeWire restart" | app's audio engine went stale when PipeWire restarted (2026-11-16 YT incident) | The user fully quits + reopens the app. Never kill `daily` the browser yourself |
+| stream connected but SILENT + "started BEFORE the last PipeWire restart" | app's audio engine went stale when PipeWire restarted (2026-11-16 YT incident) | The user fully quits + reopens the app. Never kill the user's daily browser yourself |
 | "opened before the PipeWire restart ..., no audio connection: X, Y" | same: those apps lost their PipeWire connection in the restart | The user fully quits + reopens each one they want sound from |
 | sink MUTED / volume <=2% | mixer | `pactl set-sink-mute <sink> 0` |
 | virtual sink not linked to any hardware sink / `[BREAK] routing ... not linked although its target is present` | device power-cycled and the loopback did not relink (`node.dont-reconnect` trap, 2026-11-17) | `audio-doctor --fix` (pw-link by channel, no restart). Permanent: config uses `node.dont-fallback` + `node.linger` (adi2-control `config/`) |
