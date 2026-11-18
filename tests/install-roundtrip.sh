@@ -102,6 +102,8 @@ for c in $(seq 1 "$CYCLES"); do
 
   out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
   [ $rc = 0 ] && ok "second install.sh over the first: exit 0" || { bad "second install exit $rc"; echo "$out" | tail -8; }
+  [ "$(grep -c '^b' "$M")" = 1 ] && [ "$(cut -f1,2 "$M" | sort | uniq -d)" = "" ] \
+    && ok "manifest after the second install: one bin-dir line, no duplicate entries" || bad "manifest has duplicates: $(cut -f1,2 "$M" | sort | uniq -d)"
 
   out=$("${E[@]}" "$REPO/uninstall.sh" 2>&1); rc=$?
   echo "$out" | sed 's/^/    | /'
@@ -188,7 +190,7 @@ for m in present absent; do
   rc=0; [ $m = absent ] && rc=1
   printf '#!/bin/sh\nexit %s\n' "$rc" >"$SRC/modules/$m/detect"
   printf '#!/bin/sh\nmkdir -p "$XDG_CONFIG_HOME/fake-%s" && touch "$XDG_CONFIG_HOME/fake-%s/on" && echo "%s pieces placed, bin=${XDG_BIN_HOME:-unset}"\n' $m $m $m >"$SRC/modules/$m/enable"
-  printf '#!/bin/sh\nrm -rf "$XDG_CONFIG_HOME/fake-%s"; echo "%s pieces removed"\n' $m $m >"$SRC/modules/$m/disable"
+  printf '#!/bin/sh\nrm -rf "$XDG_CONFIG_HOME/fake-%s"; echo "%s pieces removed, bin=${XDG_BIN_HOME:-unset}"\n' $m $m >"$SRC/modules/$m/disable"
   chmod +x "$SRC/modules/$m/"*
 done
 E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
@@ -197,12 +199,18 @@ echo "$out" | sed -n '/^Modules:/,/^$/p' | sed 's/^/    | /'
 [ $rc = 0 ] && echo "$out" | grep -qF "present pieces placed, bin=$H/mybin" && [ -f "$H/.config/fake-present/on" ] && [ ! -e "$H/.config/fake-absent" ] \
   && [ -x "$H/.local/share/audio-doctor/modules/present/disable" ] \
   && echo "$out" | grep -q 'Nothing in this kit restarts PipeWire' \
-  && ok "modules copied; detect && enable ran for the present one only; PipeWire restart note printed; --bindir reached the hook as XDG_BIN_HOME" \
+  && ok "modules copied; detect && enable ran for the present one only; PipeWire restart note printed; hooks got XDG_BIN_HOME = the --bindir dir" \
   || bad "module install: exit $rc"
 out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
-echo "$out" | grep '^Module' | sed 's/^/    | /'
-[ $rc = 0 ] && [ ! -e "$H/.config/fake-present" ] && [ -z "$(find "$H" -mindepth 1)" ] \
-  && ok "uninstall ran disable for each module and left nothing behind" || { bad "module uninstall: exit $rc"; find "$H" -mindepth 1; }
+echo "$out" | grep -A1 '^Module' | sed 's/^/    | /'
+[ $rc = 0 ] && echo "$out" | grep -qF "present pieces removed, bin=$H/mybin" && [ ! -e "$H/.config/fake-present" ] && [ -z "$(find "$H" -mindepth 1)" ] \
+  && ok "uninstall ran disable for each module with XDG_BIN_HOME = the install bin dir, and left nothing behind" || { bad "module uninstall: exit $rc"; find "$H" -mindepth 1; }
+out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -qF "present pieces placed, bin=$H/.local/bin" \
+  && ok "default install: hooks get XDG_BIN_HOME=\$HOME/.local/bin" || bad "default hook env: exit $rc"
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -qF "present pieces removed, bin=$H/.local/bin" && [ -z "$(find "$H" -mindepth 1)" ] \
+  && ok "default uninstall: disable got the same XDG_BIN_HOME, nothing left" || { bad "default uninstall: exit $rc"; find "$H" -mindepth 1; }
 rm -rf "$S"
 
 AFTER=$(real_snapshot)

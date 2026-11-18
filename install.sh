@@ -39,14 +39,14 @@ MOD_DST=$KIT_DATA/modules
 MANIFEST=$KIT_DATA/install-manifest
 STATE=$HOME/.local/state/omarchy-studio
 
-LINK=0 START=ask FORCE=0 CHECK_ONLY=0 BINDIR_GIVEN=0
+LINK=0 START=ask FORCE=0 CHECK_ONLY=0
 while [ $# -gt 0 ]; do
   case $1 in
     --link) LINK=1 ;;
     --start) START=yes ;;
     --no-start) START=no ;;
     --force) FORCE=1 ;;
-    --bindir) shift; BIN=$(realpath -m -- "${1:?--bindir needs a directory}"); BINDIR_GIVEN=1 ;;
+    --bindir) shift; BIN=$(realpath -m -- "${1:?--bindir needs a directory}") ;;
     --check) CHECK_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install.sh: unknown option '$1' (see --help)" >&2; exit 2 ;;
@@ -98,7 +98,8 @@ if [ $CHECK_ONLY = 1 ]; then check_deps; exit $?; fi
 
 # ------------------------------------------------------------------ manifest
 # Lines: TYPE<TAB>PATH<TAB>EXTRA. f = copied file (EXTRA = sha256), l = symlink (EXTRA = target),
-# d = directory this installer created.
+# d = directory this installer created, b = the bin dir the commands went to (handed to module hooks
+# at uninstall; only the latest run's b line is kept).
 declare -A OLD=()
 if [ -f "$MANIFEST" ]; then
   while IFS=$'\t' read -r t p x; do [ -n "${p:-}" ] && OLD[$p]=$t; done <"$MANIFEST"
@@ -188,10 +189,11 @@ if [ -d "$SRC/modules" ]; then
   for m in "$SRC"/modules/*/; do [ -d "$m" ] && MODS+=("$(basename "$m")"); done
 fi
 
+rec b "$BIN"
 # Write the manifest (deduplicated, directories kept from earlier runs).
 mkd "$KIT_DATA" || { echo "install.sh: cannot create $KIT_DATA" >&2; exit 1; }
 # Entries from an earlier run that this run did not rewrite stay, so uninstall still finds them.
-if ! { { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$2]=1; next } !($2 in seen)' "$NEW" "$MANIFEST"; } \
+if ! { { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$1 FS $2]=1; next } $1!="b" && !(($1 FS $2) in seen)' "$NEW" "$MANIFEST"; } \
        | sort -u >"$MANIFEST.tmp" && mv -f "$MANIFEST.tmp" "$MANIFEST"; }; then
   rm -f "$MANIFEST.tmp"
   echo "install.sh: FAILED to write the manifest $MANIFEST; uninstall.sh cannot find what was placed:" >&2
@@ -216,8 +218,8 @@ echo
 echo "Modules:"
 if [ ${#MODS[@]} -eq 0 ]; then echo "  none in this checkout"; fi
 ENABLED=0
-# With --bindir, hooks that link a command learn where the kit commands went (XDG_BIN_HOME).
-HOOK_ENV=(); [ $BINDIR_GIVEN = 1 ] && HOOK_ENV=(XDG_BIN_HOME="$BIN")
+# Contract: every hook gets XDG_BIN_HOME = the bin dir the kit commands went to (also with --bindir).
+HOOK_ENV=(XDG_BIN_HOME="$BIN")
 for name in "${MODS[@]}"; do
   m=$MOD_DST/$name
   if [ ! -x "$m/detect" ]; then echo "  $name: no executable detect, skipped"; continue; fi

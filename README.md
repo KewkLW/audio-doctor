@@ -31,7 +31,7 @@ No sudo, and it never installs packages. It places:
 - the device modules from `modules/` in `~/.local/share/audio-doctor/modules/`
 - a manifest of all of the above in `~/.local/share/audio-doctor/install-manifest`
 
-It honours `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. `--bindir DIR` puts the commands in DIR instead (and tells the device modules, as `XDG_BIN_HOME`). If a file it wants to place already exists and was not placed by it, it leaves that file alone and says so (`--force` replaces it).
+It honours `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. `--bindir DIR` puts the commands in DIR instead (the device modules are always told the bin dir, as `XDG_BIN_HOME`). If a file it wants to place already exists and was not placed by it, it leaves that file alone and says so (`--force` replaces it).
 
 It ends with `Done.` and exit 0 only when everything was placed (and, with `--start`, the service really started). Otherwise it lists what failed or was left alone, says `Install INCOMPLETE` and exits 1; what it did place is in the manifest, so `./uninstall.sh` still removes it. `uninstall.sh` likewise exits 1 and keeps the manifest when a removal fails, so you can run it again.
 

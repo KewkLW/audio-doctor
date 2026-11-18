@@ -51,13 +51,16 @@ if [ -n "$unit_file" ]; then
   fi
 fi
 
-# 2. Modules: run disable from the installed copy, before the files go.
+# 2. Modules: run disable from the installed copy, before the files go. Contract: hooks get
+#    XDG_BIN_HOME = the bin dir install.sh used (its b line in the manifest).
+BIN=$(awk -F'\t' '$1=="b" {b=$2} END {print b}' "$MANIFEST")
+BIN=${BIN:-$HOME/.local/bin}
 if [ -d "$MOD_DST" ]; then
   for m in "$MOD_DST"/*/; do
     [ -d "$m" ] || continue
     name=$(basename "$m")
     if [ -x "$m/disable" ]; then
-      out=$(timeout 60 "$m/disable" 2>&1); rc=$?
+      out=$(env XDG_BIN_HOME="$BIN" timeout 60 "$m/disable" 2>&1); rc=$?
       echo "Module $name: disable exit $rc"
       [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
     else
