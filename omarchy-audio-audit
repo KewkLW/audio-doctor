@@ -42,6 +42,39 @@ ARGS = sys.argv[1:]
 def opt(name, default=None):
     return ARGS[ARGS.index(name) + 1] if name in ARGS and ARGS.index(name) + 1 < len(ARGS) else default
 
+# Every flag main() reads. Checked before anything runs; parsing itself stays in main() (opt / `in ARGS`).
+FLAGS = ["--quick", "--no-root", "--first-run", "--no-disk"]
+VALUE_FLAGS = ["--loads", "--sizes", "--daw", "--sudo", "--label", "--disk-path", "--root-helper", "--rtla", "--user"]
+USAGE = """usage: omarchy-audio-audit [options]   (no options: full run, ~12 min, one sudo approval)
+  -h, --help          print this and exit (no run)
+  --quick             short probes (~4 min), for a smoke test
+  --no-root           skip the root latency probes (no sudo)
+  --loads LIST        load conditions to run, comma separated: idle,stress (default both)
+  --sizes LIST        buffer sizes for the sweep, comma separated (default 1024,256,128,64,32)
+  --daw SECS          DAW phase: a connected JACK client required; xruns at the CURRENT size for SECS per load
+  --first-run         write to the 'first-run' slot once (skips if it exists)
+  --sudo keyring      unattended: sudo password from the keyring instead of ntfy
+  --label NAME        tag the result dir
+  --no-disk           skip the NVMe cold-read (disk wake) test
+  --disk-path DIR     where the disk wake probe file lives (default: the results folder)
+  --root-helper DIR   internal: the root helper the audit starts through sudo
+  --rtla PATH         internal: rtla path for the root helper
+  --user NAME         internal: the invoking user, for the root helper
+"""
+
+
+def check_args(argv):
+    """(None, None) when argv is fine, ("help", tok) for -h/--help anywhere (also where a value would go: help never
+    starts a run), else ("bad", tok) for the first token that is not a known flag or a flag's value. Any other token
+    right after a value flag is its value (also when it looks like a flag): that is how opt() reads it."""
+    for a in argv:
+        if a in ("-h", "--help"):
+            return "help", a
+    for i, a in enumerate(argv):
+        if not (a in FLAGS or a in VALUE_FLAGS or i > 0 and argv[i - 1] in VALUE_FLAGS):
+            return "bad", a
+    return None, None
+
 RME_ON = False  # set in main() from modules/rme-adi2/detect
 STATE = os.path.expanduser("~/.local/state/omarchy-studio/audit")
 STRESS = ["stress-ng", "--cpu", "0", "--cpu-load", "70", "--vm", "2", "--vm-bytes", "512M"]
@@ -667,6 +700,11 @@ th{{background:var(--panel2);font-size:12px;text-transform:uppercase;color:var(-
 
 # ====================================================================== main
 def main():
+    kind, tok = check_args(ARGS)
+    if kind == "help":
+        sys.stdout.write(USAGE); sys.exit(0)
+    if kind == "bad":
+        sys.stderr.write(f"omarchy-audio-audit: unknown argument: {tok}\n" + USAGE); sys.exit(2)
     if "--root-helper" in ARGS:
         return root_helper(opt("--root-helper"), opt("--rtla"), opt("--user"))
     t0 = time.time()
