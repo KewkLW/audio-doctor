@@ -48,12 +48,12 @@ omarchy-audio-audit --disk-path /path/to/samples     # disk wake test on the sam
 The RME ADI-2 has **auto-standby**: after a quiet stretch it powers down and **drops off USB** (kernel: `usb 1-2: USB disconnect`, no reconnect). Audio is then gone until someone presses its button or uses its remote; the host can't wake it (a USB port power-cycle doesn't either).
 ```
 studio-keepalive on        # starts a read-only MIDI status pulse every 60 s, never changes a device setting (no RME on USB: "module off", exit 0)
-studio-keepalive off       # restores the saved value (also after a crashed run)
+studio-keepalive off       # stops the pulse; nothing to restore (a killed or crashed pulse just stops, the device timer runs again)
 studio-keepalive status
 ```
-- Run `on` **before** a DAW starts and `off` **after** it quits: Bitwig holds the ADI-2's MIDI port, and `adi2` can't reach the device while it does.
+- While a DAW (Bitwig) holds the ADI-2's MIDI port raw, the pulse can't reach the device: `on` refuses (exit 1) and `status` says so (exit 1). The pulse also ends by itself after 8 h (`KEEPALIVE_MAX_HOURS`).
 - `audit/m2-bisect.sh` and `omarchy-audio-audit` already do this; any new long or unattended test must too (refuse to run if `on` fails).
-- Permanent choice is the user's: `adi2 set device.auto_standby off|30min|1h|2h|4h`.
+- The keepalive never changes `device.auto_standby`: that stays the user's choice (`adi2 set device.auto_standby off|30min|1h|2h|4h`), so the unit still sleeps by itself when nobody is around.
 
 ## Test and tuning tools (audit/)
 | tool | what it does |

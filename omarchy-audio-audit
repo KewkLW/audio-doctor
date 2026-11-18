@@ -473,7 +473,7 @@ def power_settings(dump, chain):
         m = re.search(r"=\s*(\S+)", run(["adi2", "get", "device.auto_standby"]).stdout)
         st = m[1] if m else "?"
         add("Device", "RME ADI-2 auto-standby", st if st != "?" else "unreadable (a DAW holds its MIDI port?)", "keep" if st == "off" else ("measure" if st == "?" else "change"),
-            "Never sleeps." if st == "off" else "After a quiet stretch the ADI-2 powers down and drops off USB: audio stops until its button is pressed, and PipeWire has to recover the device. Set it off for studio use (adi2 set device.auto_standby off); automated runs use studio-keepalive.")
+            "Never sleeps." if st == "off" else "After a quiet stretch the ADI-2 powers down and drops off USB: audio stops until its button is pressed, and PipeWire has to recover the device. Keep the timer so the unit sleeps when nobody is around; automated runs use studio-keepalive, a MIDI pulse that keeps it awake only while it runs.")
     add("Kernel", "NMI watchdog", "on" if rd("/proc/sys/kernel/nmi_watchdog") == "1" else "off", "measure", "Small periodic interrupt; realtime guides turn it off. A/B with the probes.")
     tuners = [t for t in ("tlp", "powertop", "auto-cpufreq", "laptop-mode", "thermald") if run(["systemctl", "is-enabled", f"{t}.service"]).stdout.strip() == "enabled"]
     add("Tools", "Power tuners (TLP, powertop auto-tune, auto-cpufreq...)", ", ".join(tuners) or "none enabled", "change" if tuners else "keep",
