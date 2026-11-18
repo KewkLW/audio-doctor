@@ -653,8 +653,8 @@ def main():
     emit(f"  results: {outdir}")
     sweep_block = None
     if not chain.get("hardware_sink") and not RME_ON and "RME_ADI-2" in str(chain.get("waits_for") or ""):
-        notes.append(RME_OFF + ": the default output waits for the ADI-2 (off USB or in standby): buffer sweep skipped.")
-        sweep_block = "skipped: " + RME_OFF
+        notes.append("Buffer sweep skipped: the default output waits for the ADI-2, which is off USB (RME module off).")
+        sweep_block = "skipped: the default output waits for the ADI-2 (off USB)"
     elif not chain.get("hardware_sink"):
         notes.append("No hardware output found behind the default sink (routing broken? run audio-doctor --fix): buffer sweep skipped.")
         sweep_block = "skipped: no hardware output behind the default sink"
