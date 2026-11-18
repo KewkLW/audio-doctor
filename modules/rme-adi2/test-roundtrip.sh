@@ -56,7 +56,7 @@ live_sums() { find "$LIVE_CONF/pipewire/pipewire.conf.d" "$LIVE_CONF/wireplumber
                 -exec sha256sum {} + 2>/dev/null | sort -k2 | sed "s|$HOME|~|"; }
 pids() { for u in pipewire pipewire-pulse wireplumber; do echo "$u $(systemctl --user show -p MainPID --value $u 2>/dev/null)"; done; }
 LIVE_BEFORE=$(live_sums); PIDS_BEFORE=$(pids)
-echo "== L: live drop-ins before"; echo "$LIVE_BEFORE" | sed 's/^/      /'; echo "$PIDS_BEFORE" | sed 's/^/      /'
+echo "== L: live drop-ins before"; echo "${LIVE_BEFORE:-(none)}" | sed 's/^/      /'; echo "$PIDS_BEFORE" | sed 's/^/      /'
 if [ -n "$EVID" ]; then mkdir -p "$EVID" && echo "$LIVE_BEFORE" >"$EVID/live-before.sha"; fi
 
 export XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data XDG_BIN_HOME=$T/bin XDG_STATE_HOME=$T/state
@@ -239,7 +239,10 @@ rme = lambda x: "RME_ADI-2" in str(x) or "ADI-2" in str(x)
 assert not [n for n, v in d["sinks"].items() if rme(n) or rme(v.get("desc")) or any(rme(h) for h in v.get("feeds_hardware") or [])], d["sinks"]
 assert not [s for s in d["streams"] if rme(s.get("sink")) or any(rme(x) for x in s.get("linked_to") or [])], d["streams"]
 assert not [u for u in d["hardware"]["usb_audio"] if rme(u)]
-assert not [f for f in d["findings"] if f["severity"] in ("BREAK","WARN") or rme(f["message"])], d["findings"]'
+assert not [f for f in d["findings"] if f["severity"] in ("BREAK","WARN") or rme(f["message"]) or rme(f.get("fix"))], d["findings"]
+# the whole document: no ADI-2 name anywhere (only the rme/rme_module keys)
+import re; doc = json.dumps({k: v for k, v in d.items() if k not in ("rme", "rme_module")})
+assert not re.search(r"(?i)rme_adi|adi-?2|\brme_", doc), re.findall(r"(?i).{30}(?:rme_adi|adi-?2|\brme_).{30}", doc)'
   out=$(live env PATH="$ABSENT_PATH" "$REPO/config-audit" 2>&1); rc=$?; [ $i = 1 ] && echo "$out" | mask
   check "C$i config-audit (live config, read only): exit 0" [ $rc = 0 ]
   check "C$i config-audit (live config): no RME BREAK/WARN, at most one neutral line" \
@@ -291,9 +294,9 @@ done
 
 # ---- L: live state after everything
 LIVE_AFTER=$(live_sums); PIDS_AFTER=$(pids)
-echo "== L: live drop-ins after"; echo "$LIVE_AFTER" | sed 's/^/      /'; echo "$PIDS_AFTER" | sed 's/^/      /'
+echo "== L: live drop-ins after"; echo "${LIVE_AFTER:-(none)}" | sed 's/^/      /'; echo "$PIDS_AFTER" | sed 's/^/      /'
 if [ -n "$EVID" ]; then echo "$LIVE_AFTER" >"$EVID/live-after.sha"; fi
-check "L1 live drop-ins: identical sha256 before and after" bash -c '[ -n "$1" ] && [ "$1" = "$2" ]' _ "$LIVE_BEFORE" "$LIVE_AFTER"
+check "L1 live drop-ins: identical sha256 before and after" [ "$LIVE_BEFORE" = "$LIVE_AFTER" ]
 check "L2 no PipeWire/WirePlumber restart (same MainPIDs)" [ "$PIDS_BEFORE" = "$PIDS_AFTER" ]
 
 echo "== $passes passed, $fails failed"

@@ -233,6 +233,7 @@ def main():
     hw = hardware()
     if not rme_on:  # detect is the module's switch: no ADI-2 hardware row while it says absent
         hw["usb_audio"] = [u for u in hw["usb_audio"] if "ADI-2" not in u]
+        hw["alsa_cards"] = [c for c in hw["alsa_cards"] if "ADI-2" not in c["desc"]]
     nodes, links, dump = graph()
     wbox = {}
     def _whatis():
@@ -377,7 +378,7 @@ def main():
         if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
         elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
         if not s["linked_to"]: find("BREAK", "routing", f"{tag} is not linked to any sink")
-        elif s["sink"] and s["sink"] != def_sink and s.get("api") != "jack": find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
+        elif s["sink"] and s["sink"] != def_sink and not rme_target(def_sink) and s.get("api") != "jack": find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
         if s["corked"]: find("INFO", "stream", f"{tag} is paused (corked) by the app")
         elif silent(s["level"]):
             st = whatis.Proc(int(s["pid"])).start if str(s.get("pid") or "").isdigit() else None
@@ -421,7 +422,7 @@ def main():
 
     order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
     findings.sort(key=lambda f: order[f["severity"]])
-    report = {"took_s": round(time.time() - t0, 1), "default_sink": def_sink, "services": svc, "hardware": hw,
+    report = {"took_s": round(time.time() - t0, 1), "default_sink": None if rme_target(def_sink) else def_sink, "services": svc, "hardware": hw,
               "sinks": sink_info, "streams": streams, "apps": apps, "rme": rme,
               "rme_module": "on" if rme_on else "off", "findings": findings}
     if JSON:
