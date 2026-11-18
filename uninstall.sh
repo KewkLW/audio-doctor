@@ -38,16 +38,22 @@ fi
 # exactly that: f/l lines whose path still exists, d lines whose directory still exists, m lines whose
 # disable hook is still listed, and the b line. A module that disabled fine and was removed drops out,
 # so a retry does not trip over its missing hook.
+declare -A MOD_OK=()   # modules whose disable ran fine this run (or that have none)
 rewrite_manifest() {
-  local mt t p x
+  local mt t p x k pend=()
   declare -A hook=()
+  # A module not in MOD_OK (its disable failed, was not run, or had not run yet at an interrupt) keeps
+  # every one of its lines, also its m line and hook line when the hook file is gone: the next run must
+  # stop at it again rather than remove its files without disable having run.
+  while IFS=$'\t' read -r t p x; do [ "$t" = m ] && [ -z "${MOD_OK[$p]+x}" ] && pend+=("$p"); done <"$MANIFEST"
+  in_pending() { local k; for k in "${pend[@]}"; do case $1 in "$k"|"$k"/*) return 0 ;; esac; done; return 1; }
   mt=$(mktemp "$KIT_DATA/.install-manifest.XXXXXX") || return 1
   {
     while IFS=$'\t' read -r t p x; do
-      case $t in
-        b) printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}" ;;
-        f|l|d) if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}"; [ "$t" = f ] && hook[$p]=1; fi ;;
-      esac
+      [ "$t" = m ] && continue
+      if [ "$t" = b ] || { [ ${#pend[@]} -gt 0 ] && in_pending "$p"; } || [ -e "$p" ] || [ -L "$p" ]; then
+        printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}"; [ "$t" = f ] && hook[$p]=1
+      fi
     done <"$MANIFEST"
     while IFS=$'\t' read -r t p x; do
       [ "$t" = m ] && [ -n "${hook[$p/disable]+x}" ] && printf '%s\t%s\t%s\n' "$t" "$p" "${x:-}"
@@ -88,7 +94,7 @@ fi
 #    XDG_BIN_HOME = the bin dir install.sh used (its b line in the manifest).
 BIN=$(awk -F'\t' '$1=="b" {b=$2} END {print b}' "$MANIFEST")
 BIN=${BIN:-$HOME/.local/bin}
-# A module whose disable fails keeps its installed copy (and the manifest stays), so running
+# A module whose disable fails keeps its installed copy (and its manifest lines), so running
 # uninstall.sh again retries that disable instead of stranding what enable placed.
 # Only modules install.sh recorded (m lines) are touched, and a disable runs only when it is still the
 # exact file install.sh placed (its f line hash). Anything else under the module directory is not ours:
@@ -101,7 +107,7 @@ while IFS=$'\t' read -r t p x; do
   name=${x:-$(basename "$p")}
   hook=$p/disable
   want=$(awk -F'\t' -v h="$hook" '$1=="f" && $2==h {print $3}' "$MANIFEST")
-  if [ -z "$want" ]; then echo "Module $name: install.sh placed no disable, nothing run"; continue; fi
+  if [ -z "$want" ]; then echo "Module $name: install.sh placed no disable, nothing run"; MOD_OK[$p]=1; continue; fi
   if [ ! -f "$hook" ] || [ -L "$hook" ] || [ ! -x "$hook" ] || [ "$(sha256sum "$hook" | cut -d' ' -f1)" != "$want" ]; then
     echo "Module $name: disable NOT run: $hook is missing or changed since install"
     FAILED+=("module $name: $hook is not the file install.sh placed, so it was not run and what enable placed may still be there; run install.sh --force (it restores the hook), then uninstall.sh")
@@ -112,8 +118,10 @@ while IFS=$'\t' read -r t p x; do
   echo "Module $name: disable exit $rc"
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
   if [ $rc -ne 0 ]; then
-    FAILED+=("module $name: disable exit $rc; kept $p and the manifest: fix the cause, then run uninstall.sh again")
+    FAILED+=("module $name: disable exit $rc; kept $p and its manifest lines: fix the cause, then run uninstall.sh again")
     KEEP_MODS+=("$p")
+  else
+    MOD_OK[$p]=1
   fi
 done <"$MANIFEST"
 if [ -d "$MOD_DST" ] && [ ! -L "$MOD_DST" ]; then

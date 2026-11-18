@@ -387,6 +387,30 @@ out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
   || { bad "retry after tamper: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; find "$H" -mindepth 1 -type f; }
 rm -rf "$S"
 
+# (c2) A hook install.sh placed, deleted after install: uninstall never removes that module's other
+#      files without disable having run, on the first run and on a retry (both exit 1, m line kept);
+#      install.sh --force puts the hook back and the next uninstall finishes clean.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; MK=$S/marks; mkdir -p "$H" "$MK"; mk_src "$SRC"
+mk_mod "$SRC/modules/gone" ours "$MK"
+MD=$H/.local/share/audio-doctor/modules; M=$H/.local/share/audio-doctor/install-manifest
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+"${E[@]}" "$SRC/install.sh" --no-start >/dev/null 2>&1
+rm -f "$MD/gone/disable" "$MK"/*
+for try in 1 2; do
+  out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+  [ $rc = 1 ] && echo "$out" | grep -q 'gone: disable NOT run' && [ -f "$MD/gone/detect" ] && [ -f "$MD/gone/enable" ] \
+    && grep -qP "^m\t$MD/gone\t" "$M" && grep -qP "^f\t$MD/gone/disable\t" "$M" && [ -z "$(ls -A "$MK")" ] \
+    && ok "deleted hook, uninstall run $try: exit 1, module files and its m and hook lines kept, nothing executed" \
+    || { bad "deleted hook run $try: exit $rc"; echo "$out" | tail -10; cat "$M" 2>/dev/null; }
+done
+out=$("${E[@]}" "$SRC/install.sh" --no-start --force 2>&1); rc=$?
+rm -f "$MK"/*
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ -e "$MK/ours-disable" ] && [ -z "$(find "$H" -mindepth 1)" ] \
+  && ok "after install.sh --force restored the deleted hook: disable ran, exit 0, nothing left" \
+  || { bad "deleted hook restore: exit $rc"; echo "$out" | tail -8; find "$H" -mindepth 1; }
+rm -rf "$S"
+
 # (d) Mixed module result: "good" disables fine, "stuck" fails. The first uninstall exits 1 and
 #     rewrites the manifest to what is still on disk (good drops out, stuck stays); after the fault is
 #     fixed the second uninstall finishes clean with exit 0.
