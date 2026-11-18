@@ -248,7 +248,7 @@ def main():
 
     # card profiles
     for c in cards:
-        if c.get("active_profile") == "off":
+        if c.get("active_profile") == "off" and (rme_on or not confaudit.is_rme(c.get("name"))):
             find("WARN", "hardware", f"card '{c['properties'].get('device.description', c['name'])}' profile is OFF", f"pactl set-card-profile {c['name']} <profile>")
     # RME module off (detect: ADI-2 not on USB, standby included): sinks that belong to the ADI-2 (its ALSA sinks, and
     # loopback sinks whose .out leg targets it) may linger; none of their checks, nor those of streams into them, run.

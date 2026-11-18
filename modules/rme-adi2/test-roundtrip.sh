@@ -173,7 +173,14 @@ for i in 1 2; do
   check "C$i audio-doctor --json: module off, no RME finding" python3 -c '
 import json,sys; d=json.loads(sys.argv[1]); assert d["rme_module"]=="off" and d["rme"] is None
 bad=[f for f in d["findings"] if f["severity"] in ("BREAK","WARN") and ("rme" in f["message"].lower() or "adi-2" in f["message"].lower())]
-assert not bad, bad' "$out"
+assert not bad, bad
+# streams into ADI-2 sinks: their findings carry the app label, not "RME", so match on the stream tag
+rme_sinks = {n for n, v in d["sinks"].items() if "RME_ADI-2" in n or any("RME_ADI-2" in h for h in (v.get("feeds_hardware") or []))}
+into = [s for s in d["streams"] if s.get("sink") in rme_sinks]
+tags = [s["label"] + " [" + s["media"][:40] + "]" for s in into]
+hit = [f for f in d["findings"] if any(f["message"].startswith(t) for t in tags)]
+assert not hit, hit
+print(f"      ({len(rme_sinks)} lingering ADI-2 sinks, {len(into)} streams into them: no finding for any of them)")' "$out"
   check "C$i audio-doctor: lingering ADI-2 sinks are in the skipped (module off) set" python3 - "$REPO" <<'EOF'
 import importlib.machinery, importlib.util, os, sys
 ld = importlib.machinery.SourceFileLoader("ad", os.path.join(sys.argv[1], "audio-doctor"))
