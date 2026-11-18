@@ -55,14 +55,21 @@ fi
 #    XDG_BIN_HOME = the bin dir install.sh used (its b line in the manifest).
 BIN=$(awk -F'\t' '$1=="b" {b=$2} END {print b}' "$MANIFEST")
 BIN=${BIN:-$HOME/.local/bin}
+# A module whose disable fails keeps its installed copy (and the manifest stays), so running
+# uninstall.sh again retries that disable instead of stranding what enable placed.
+KEEP_MODS=()
 if [ -d "$MOD_DST" ]; then
   for m in "$MOD_DST"/*/; do
     [ -d "$m" ] || continue
-    name=$(basename "$m")
+    m=${m%/}; name=$(basename "$m")
     if [ -x "$m/disable" ]; then
       out=$(env XDG_BIN_HOME="$BIN" timeout 60 "$m/disable" 2>&1); rc=$?
       echo "Module $name: disable exit $rc"
       [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+      if [ $rc -ne 0 ]; then
+        FAILED+=("module $name: disable exit $rc; kept $m so uninstall.sh can run it again")
+        KEEP_MODS+=("$m")
+      fi
     else
       echo "Module $name: no executable disable, nothing run"
     fi
@@ -71,6 +78,11 @@ fi
 
 # 3. Files and links, only when they are still what install.sh put there.
 under_state() { case $1 in "$STATE"|"$STATE"/*) return 0 ;; esac; return 1; }
+in_kept_module() {
+  local k
+  for k in "${KEEP_MODS[@]}"; do case $1 in "$k"|"$k"/*) return 0 ;; esac; done
+  return 1
+}
 removed=0 kept=()
 rm_one() {
   if rm -f "$1"; then removed=$((removed + 1)); echo "  removed $1"
@@ -79,6 +91,7 @@ rm_one() {
 while IFS=$'\t' read -r t p x; do
   [ -n "${p:-}" ] || continue
   if under_state "$p"; then kept+=("$p (inside your data directory, never removed)"); continue; fi
+  if [ ${#KEEP_MODS[@]} -gt 0 ] && in_kept_module "$p"; then [ "$t" = d ] || kept+=("$p (its module's disable failed)"); continue; fi
   case $t in
     f)
       if [ -f "$p" ] && [ ! -L "$p" ]; then
@@ -93,18 +106,11 @@ while IFS=$'\t' read -r t p x; do
   esac
 done <"$MANIFEST"
 
-# Bytecode Python leaves next to installed commands when one loads another by path (audio-doctor
-# imports whatis and config-audit); file names look like whatiscpython-314.pyc.
-while IFS=$'\t' read -r t p x; do
-  case $t in f|l) ;; *) continue ;; esac
-  pc=$(dirname "$p")/__pycache__
-  [ -d "$pc" ] || continue
-  b=$(basename "$p")
-  for c in "$pc/$b"cpython-*.pyc "$pc/${b%.py}".cpython-*.pyc; do
-    [ -f "$c" ] && rm -f "$c" && echo "  removed $c"
-  done
-  rmdir "$pc" 2>/dev/null && echo "  removed $pc/"
-done <"$MANIFEST"
+# Bytecode install.sh wrote is in the manifest and went above. Python may write more at run time
+# (for example after a Python upgrade): not placed by install.sh, so it is reported, never deleted.
+while IFS= read -r pc; do
+  for c in "$pc"/*; do [ -e "$c" ] && kept+=("$c (written by Python at run time, not by install.sh)"); done
+done < <(awk -F'\t' '$1=="d" && $2 ~ /\/__pycache__$/ {print $2}' "$MANIFEST")
 
 if [ $SD = 1 ]; then systemctl --user daemon-reload || FAILED+=("systemctl --user daemon-reload failed"); fi
 

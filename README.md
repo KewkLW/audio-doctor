@@ -61,7 +61,7 @@ The installer checks these and prints the package to install for anything missin
 ./uninstall.sh
 ```
 
-It stops and disables the watch service, runs each module's `disable`, then removes exactly the files in the manifest. A file you edited after install is kept and listed. It never deletes your results in `~/.local/state/omarchy-studio/` (audit reports, watch logs, footprints) or any report you saved elsewhere; it prints where they are so you can delete them yourself.
+It stops and disables the watch service, runs each module's `disable`, then removes exactly the files in the manifest (the copied commands, their Python bytecode, the unit, the skill, the modules). A file you edited after install is kept and listed. Bytecode Python wrote later on its own (for example after a Python upgrade) is listed, not deleted. If a module's `disable` fails, that module's installed copy and the manifest stay and it exits 1; fix the cause and run `./uninstall.sh` again. It never deletes your results in `~/.local/state/omarchy-studio/` (audit reports, watch logs, footprints) or any report you saved elsewhere; it prints where they are so you can delete them yourself.
 
 ## Testing the installer
 
@@ -69,7 +69,7 @@ It stops and disables the watch service, runs each module's `disable`, then remo
 tests/install-roundtrip.sh [cycles]
 ```
 
-Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is only parsed), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with two fake modules, and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
+Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is loaded up to its main entry point but not run, since every run opens a playback stream), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with fake modules (including one whose `disable` fails), and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
 
 ## What the kit changes on your system
 

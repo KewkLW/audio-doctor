@@ -160,10 +160,27 @@ echo "audio-doctor kit: installing from $SRC"
 check_deps; DEPS_OK=$?
 echo
 
+# Bytecode for a copied Python command. audio-doctor loads whatis and config-audit by path, so Python
+# would write bin/__pycache__/<name>cpython-3XX.pyc at run time, a file no manifest knows. Writing it
+# here (same name and contents Python would use) puts it in the manifest; Python then reads it as is.
+# A cache file that is already there and not ours is left alone (not an error: Python reuses it).
+put_pyc() {   # put_pyc DST
+  local dst=$1 pyc
+  head -1 "$dst" | grep -q python3 || return 0
+  pyc=$(python3 -I -c 'import importlib.util,sys; print(importlib.util.cache_from_source(sys.argv[1]))' "$dst" 2>/dev/null) || return 0
+  if [ -e "$pyc" ] || [ -L "$pyc" ]; then [ -n "${OLD[$pyc]+x}" ] || return 0; fi
+  mkd "$(dirname "$pyc")" || { FAILED+=("$pyc (cannot create its directory)"); return 1; }
+  python3 -I -c 'import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)' "$dst" "$pyc" \
+    || { rm -f "$pyc"; FAILED+=("$pyc (bytecode compile failed)"); return 1; }
+  rec f "$pyc" "$(sha256sum "$pyc" | cut -d' ' -f1)"
+  PLACED+=("$pyc")
+}
+
 for e in "${KIT[@]}"; do
   s=${e%%:*} n=${e#*:}
   if [ ! -f "$SRC/$s" ]; then FAILED+=("$BIN/$n (source $s not found in the checkout)"); continue; fi
-  if [ $LINK = 1 ]; then put_link "$SRC/$s" "$BIN/$n"; else put_file "$SRC/$s" "$BIN/$n" 0755; fi
+  if [ $LINK = 1 ]; then put_link "$SRC/$s" "$BIN/$n"   # linked: Python caches inside the checkout, not here
+  else put_file "$SRC/$s" "$BIN/$n" 0755 && put_pyc "$BIN/$n"; fi
 done
 
 # Watch unit: ExecStart points at the bin directory used above.

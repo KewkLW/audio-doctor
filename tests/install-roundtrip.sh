@@ -9,7 +9,8 @@
 # PATH shim) must give exit 1, never "Done".
 #
 # Plays no audio and opens no stream: audio-doctor runs as `--audit` (config only) and
-# omarchy-audio-audit, which starts a full measured run with any argument, is only parsed.
+# omarchy-audio-audit, which starts a full measured run with a stream whenever main() runs, is
+# loaded from its installed path up to the main() guard (imports and definitions run, main() does not).
 # It never calls the real systemctl with a write verb: the scratch unit dir is not on the user
 # manager's path, so install.sh and uninstall.sh leave systemd alone; the --start test uses a shim.
 set -u
@@ -88,15 +89,32 @@ for c in $(seq 1 "$CYCLES"); do
   run footprint 'compare'
   run config-audit 'config audit: [0-9]+ drop-ins read'
   run audio-doctor 'config audit: [0-9]+ drop-ins read' --audit
-  if "${E[@]}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$H/.local/bin/omarchy-audio-audit" \
-     && head -1 "$H/.local/bin/omarchy-audio-audit" | grep -q python3; then
-    ok "omarchy-audio-audit parses (not run: any argument starts a measured run with a stream; audio hold)"
-  else bad "omarchy-audio-audit does not parse"; fi
+  # omarchy-audio-audit has no --help or dry mode: any invocation of main() starts a measured run that
+  # opens a playback stream, and the audio hold (Conductor ruling) forbids that. So the installed file is
+  # executed by the installed path up to its `if __name__ == "__main__"` guard: every import, constant
+  # and definition runs, main() does not. Logged as a GAP (no --help); see the bounty evidence.
+  o=$("${E[@]}" timeout 30 python3 -I -B -c '
+import runpy, sys
+g = runpy.run_path(sys.argv[1], run_name="install_smoke")
+assert callable(g.get("main")), "no main()"
+print("loaded", sys.argv[1], "main() present, not called")' "$H/.local/bin/omarchy-audio-audit" 2>&1); r=$?
+  if [ $r = 0 ] && [ -x "$H/.local/bin/omarchy-audio-audit" ]; then
+    ok "omarchy-audio-audit: executable, module code ran from the installed path, main() not called (audio hold): $(echo "$o" | sed "s|$H|~|")"
+  else bad "omarchy-audio-audit failed to load (exit $r)"; echo "$o" | tail -5 | sed 's/^/      /'; fi
+
+  # Bytecode next to the commands must all come from install.sh (it is in the manifest).
+  stray_pyc=$(find "$H/.local/bin" -path '*/__pycache__/*' -type f | grep -vxF -f <(awk -F'\t' '$1=="f" {print $2}' "$M"))
+  [ -z "$stray_pyc" ] && ok "every bytecode file in the bin dir after running the commands is one install.sh placed: $(cd "$H" && find .local/bin -path '*/__pycache__/*' -type f | tr '\n' ' ')" \
+    || bad "Python wrote bytecode the manifest does not know: $stray_pyc"
+  pyc_hash_ok=1
+  while IFS=$'\t' read -r t p x; do
+    case $p in */__pycache__/*) [ "$(sha256sum "$p" | cut -d' ' -f1)" = "$x" ] || { pyc_hash_ok=0; bad "Python rewrote $p after install"; } ;; esac
+  done <"$M"
+  [ $pyc_hash_ok = 1 ] && ok "installed bytecode unchanged after the commands ran (uninstall will match its hash)"
 
   # Files the commands themselves wrote while running (for example libpulse's ~/.config/pulse/cookie):
-  # user data, not installed, so uninstall must keep them. Python bytecode next to the commands is the
-  # exception: uninstall.sh removes it.
-  RUNTIME=$( (cd "$H" && find . \( -type f -o -type l \) | sort) | grep -vxF -f <(echo "$POSTINST") | grep -v '^\./\.local/bin/__pycache__/' )
+  # user data, not installed, so uninstall must keep them.
+  RUNTIME=$( (cd "$H" && find . \( -type f -o -type l \) | sort) | grep -vxF -f <(echo "$POSTINST") )
   echo "  made by the commands at run time (not by install.sh): ${RUNTIME:-none}"
   EXPECT=$(printf '%s\n%s\n' "$SEED" "$RUNTIME" | grep -v '^$' | sort)
 
@@ -129,6 +147,19 @@ out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
 "${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1
 [ "$(cd "$H" && find . -mindepth 1 | sort | tr '\n' ' ')" = "./.local ./.local/bin ./.local/bin/whatis " ] \
   && ok "uninstall after a partial install leaves only the foreign file" || bad "partial uninstall left: $(cd "$H" && find . -mindepth 1)"
+rm -rf "$S"
+
+# Bytecode Python wrote at run time that install.sh did not (for example after a Python upgrade):
+# uninstall.sh reports it and leaves it.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+"${E[@]}" "$REPO/install.sh" --no-start >/dev/null 2>&1
+echo "not ours" >"$H/.local/bin/__pycache__/whatiscpython-399.pyc"
+out=$("${E[@]}" "$REPO/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ "$(cat "$H/.local/bin/__pycache__/whatiscpython-399.pyc")" = "not ours" ] \
+  && echo "$out" | grep -q 'whatiscpython-399.pyc (written by Python at run time, not by install.sh)' \
+  && [ "$(cd "$H" && find . -mindepth 1 -type f)" = "./.local/bin/__pycache__/whatiscpython-399.pyc" ] \
+  && ok "bytecode not placed by install.sh: reported and left, everything else removed" || { bad "runtime bytecode: exit $rc"; echo "$out" | tail -8; }
 rm -rf "$S"
 
 S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H/.local/bin"; chmod 555 "$H/.local/bin"
@@ -211,6 +242,32 @@ out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
 out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
 [ $rc = 0 ] && echo "$out" | grep -qF "present pieces removed, bin=$H/.local/bin" && [ -z "$(find "$H" -mindepth 1)" ] \
   && ok "default uninstall: disable got the same XDG_BIN_HOME, nothing left" || { bad "default uninstall: exit $rc"; find "$H" -mindepth 1; }
+rm -rf "$S"
+
+# A module whose disable fails: uninstall must exit 1, keep that module's installed copy and the
+# manifest, and a second uninstall (after the cause is fixed) must finish the job.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; mkdir -p "$H" "$SRC"
+(cd "$REPO" && git ls-files -z | xargs -0 cp --parents -t "$SRC"); rm -rf "$SRC/modules"
+mkdir -p "$SRC/modules/stuck"
+printf '#!/bin/sh\nexit 0\n' >"$SRC/modules/stuck/detect"
+printf '#!/bin/sh\nmkdir -p "$XDG_CONFIG_HOME/fake-stuck" && touch "$XDG_CONFIG_HOME/fake-stuck/on" && echo placed\n' >"$SRC/modules/stuck/enable"
+printf '#!/bin/sh\n[ -e "%s/fixed" ] || { echo "cannot remove pieces: simulated fault"; exit 1; }\nrm -rf "$XDG_CONFIG_HOME/fake-stuck"; echo removed\n' "$S" >"$SRC/modules/stuck/disable"
+chmod +x "$SRC/modules/stuck/"*
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 0 ] && [ -f "$H/.config/fake-stuck/on" ] && ok "failing-disable module: installed and enabled" || bad "stuck module install: exit $rc"
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+echo "$out" | sed -n '/^Module/,/^  [^ ]/p;/^FAILED:/,$p' | sed 's/^/    | /'
+M=$H/.local/share/audio-doctor/install-manifest
+[ $rc = 1 ] && echo "$out" | grep -q 'module stuck: disable exit 1' && ! echo "$out" | grep -q "removed $H/.local/share/audio-doctor/modules/stuck/" \
+  && [ -x "$H/.local/share/audio-doctor/modules/stuck/disable" ] && [ -f "$M" ] && [ -f "$H/.config/fake-stuck/on" ] \
+  && [ ! -e "$H/.local/bin/whatis" ] \
+  && ok "disable failed: exit 1, FAILED listed, module copy and manifest kept, its pieces untouched, the rest removed" \
+  || { bad "failing disable: exit $rc"; echo "$out" | tail -12; }
+touch "$S/fixed"
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -q 'Module stuck: disable exit 0' && [ -z "$(find "$H" -mindepth 1)" ] \
+  && ok "second uninstall after the fault is fixed: disable ran again, exit 0, nothing left" || { bad "retry uninstall: exit $rc"; echo "$out" | tail -8; find "$H" -mindepth 1; }
 rm -rf "$S"
 
 AFTER=$(real_snapshot)
