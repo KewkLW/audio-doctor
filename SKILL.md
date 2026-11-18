@@ -59,8 +59,8 @@ studio-keepalive status
 | tool | what it does |
 |---|---|
 | `daw-ramp` | Bitwig dropout ramp/bisect through BitwigBridge (opens chunk projects, activates groups, proves play, counts xruns per sample). `m2-bisect.sh` wraps it unattended (mute, keepalive, silent launch, restore). |
-| `power-ab` | root, once: runtime-only A/B of NMI watchdog, GPU lock under load, NVMe APST, ASPM; originals saved, reverted, read back |
-| `studio-power-apply` | root, once: NVMe APST cap per audio drive (udev by serial, gated) + `studio-gpu-lock` service |
+| `power-ab OUT USER TORCH_PYTHON` | root, once: runtime-only A/B of NMI watchdog, GPU lock under load, NVMe APST, ASPM; originals saved, reverted, read back |
+| `studio-power-apply OUT USER SERIAL[=LABEL]...` | root, once: NVMe APST cap per audio drive (udev by serial, gated) + `studio-gpu-lock` service |
 | `omarchy-audio-watch` | always-on 30 s monitor (GPU/CPU/NVMe/xruns/Xid, activity-tagged) + `report OUT.html`; `event "text"` marks changes |
 | `footprint NAME` / `compare A B` | memory/CPU/threads before vs after (e.g. DAW loaded) |
 | `quiet-park park|unpark` | freeze background services for a clean test (never auto-unpark) |
@@ -111,5 +111,5 @@ Runtimes: native, chromium-webapp (`--app=` URL), electron (app.asar), wine-prot
 ## Rules
 - Avoid restarting PipeWire while the user has apps open: it is what stales their audio. If you must, run `whatis --audio` first and tell the user which apps to reopen.
 - Never raise device or sink volume without asking (ears, speakers).
-- GUI view: `qpwgraph` (launch, then move silently to his workspace with
+- GUI view: `qpwgraph` (launch, then move silently to their workspace with
   `hyprctl dispatch 'hl.dsp.window.move({ workspace = N, follow = false, window = "pid:PID" })'`).
