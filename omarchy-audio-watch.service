@@ -1,0 +1,12 @@
+[Unit]
+Description=Omarchy Studio audio watch: GPU/CPU/NVMe/xrun monitor (30 s samples, ~/.local/state/omarchy-studio/watch)
+After=pipewire.service
+
+[Service]
+ExecStart=@BINDIR@/omarchy-audio-watch run --interval 30
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target
