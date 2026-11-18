@@ -187,17 +187,17 @@ for m in present absent; do
   mkdir -p "$SRC/modules/$m"
   rc=0; [ $m = absent ] && rc=1
   printf '#!/bin/sh\nexit %s\n' "$rc" >"$SRC/modules/$m/detect"
-  printf '#!/bin/sh\nmkdir -p "$XDG_CONFIG_HOME/fake-%s" && touch "$XDG_CONFIG_HOME/fake-%s/on" && echo "%s pieces placed"\n' $m $m $m >"$SRC/modules/$m/enable"
+  printf '#!/bin/sh\nmkdir -p "$XDG_CONFIG_HOME/fake-%s" && touch "$XDG_CONFIG_HOME/fake-%s/on" && echo "%s pieces placed, bin=${XDG_BIN_HOME:-unset}"\n' $m $m $m >"$SRC/modules/$m/enable"
   printf '#!/bin/sh\nrm -rf "$XDG_CONFIG_HOME/fake-%s"; echo "%s pieces removed"\n' $m $m >"$SRC/modules/$m/disable"
   chmod +x "$SRC/modules/$m/"*
 done
 E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
-out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+out=$("${E[@]}" "$SRC/install.sh" --no-start --bindir "$H/mybin" 2>&1); rc=$?
 echo "$out" | sed -n '/^Modules:/,/^$/p' | sed 's/^/    | /'
-[ $rc = 0 ] && [ -f "$H/.config/fake-present/on" ] && [ ! -e "$H/.config/fake-absent" ] \
+[ $rc = 0 ] && echo "$out" | grep -qF "present pieces placed, bin=$H/mybin" && [ -f "$H/.config/fake-present/on" ] && [ ! -e "$H/.config/fake-absent" ] \
   && [ -x "$H/.local/share/audio-doctor/modules/present/disable" ] \
   && echo "$out" | grep -q 'Nothing in this kit restarts PipeWire' \
-  && ok "modules copied; detect && enable ran for the present one only; PipeWire restart note printed" \
+  && ok "modules copied; detect && enable ran for the present one only; PipeWire restart note printed; --bindir reached the hook as XDG_BIN_HOME" \
   || bad "module install: exit $rc"
 out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
 echo "$out" | grep '^Module' | sed 's/^/    | /'

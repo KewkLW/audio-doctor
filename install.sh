@@ -39,14 +39,14 @@ MOD_DST=$KIT_DATA/modules
 MANIFEST=$KIT_DATA/install-manifest
 STATE=$HOME/.local/state/omarchy-studio
 
-LINK=0 START=ask FORCE=0 CHECK_ONLY=0
+LINK=0 START=ask FORCE=0 CHECK_ONLY=0 BINDIR_GIVEN=0
 while [ $# -gt 0 ]; do
   case $1 in
     --link) LINK=1 ;;
     --start) START=yes ;;
     --no-start) START=no ;;
     --force) FORCE=1 ;;
-    --bindir) shift; BIN=$(realpath -m -- "${1:?--bindir needs a directory}") ;;
+    --bindir) shift; BIN=$(realpath -m -- "${1:?--bindir needs a directory}"); BINDIR_GIVEN=1 ;;
     --check) CHECK_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install.sh: unknown option '$1' (see --help)" >&2; exit 2 ;;
@@ -216,13 +216,15 @@ echo
 echo "Modules:"
 if [ ${#MODS[@]} -eq 0 ]; then echo "  none in this checkout"; fi
 ENABLED=0
+# With --bindir, hooks that link a command learn where the kit commands went (XDG_BIN_HOME).
+HOOK_ENV=(); [ $BINDIR_GIVEN = 1 ] && HOOK_ENV=(XDG_BIN_HOME="$BIN")
 for name in "${MODS[@]}"; do
   m=$MOD_DST/$name
   if [ ! -x "$m/detect" ]; then echo "  $name: no executable detect, skipped"; continue; fi
-  out=$(timeout 30 "$m/detect" 2>&1); rc=$?
+  out=$(env "${HOOK_ENV[@]}" timeout 30 "$m/detect" 2>&1); rc=$?
   if [ $rc -ne 0 ]; then echo "  $name: device not present, not enabled${out:+ ($out)}"; continue; fi
   if [ ! -x "$m/enable" ]; then echo "  $name: detected, but it has no executable enable"; continue; fi
-  out=$(timeout 60 "$m/enable" 2>&1); rc=$?
+  out=$(env "${HOOK_ENV[@]}" timeout 60 "$m/enable" 2>&1); rc=$?
   echo "  $name: detected, enable exit $rc"
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/    /'
   [ $rc -eq 0 ] && ENABLED=1
