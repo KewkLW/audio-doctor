@@ -98,7 +98,8 @@ if [ $CHECK_ONLY = 1 ]; then check_deps; exit $?; fi
 
 # ------------------------------------------------------------------ manifest
 # Lines: TYPE<TAB>PATH<TAB>EXTRA. f = copied file (EXTRA = sha256), l = symlink (EXTRA = target),
-# d = directory this installer created, b = the bin dir the commands went to (handed to module hooks
+# d = directory this installer created, m = a module directory whose files this installer placed
+# (uninstall runs disable only for these, and only when the hook still has its recorded hash), b = the bin dir the commands went to (handed to module hooks
 # at uninstall; only the latest run's b line is kept).
 declare -A OLD=()
 if [ -f "$MANIFEST" ]; then
@@ -108,6 +109,7 @@ NEW=$(mktemp) || exit 1
 trap 'rm -f "$NEW"' EXIT
 rec() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >>"$NEW"; }
 PLACED=() SKIPPED=() FAILED=()
+declare -A PH=()   # sha256 of every file this run placed: module hooks run only when they match
 
 mkd() {   # create a directory and every missing parent, recording each one created
   local d=$1
@@ -133,7 +135,8 @@ put_file() {   # put_file SRC DST MODE
   mkd "$(dirname "$dst")" || { FAILED+=("$dst (cannot create its directory)"); return 1; }
   tmp=$(mktemp "$(dirname "$dst")/.audio-doctor-install.XXXXXX") || { FAILED+=("$dst (cannot create a temp file)"); return 1; }
   cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; FAILED+=("$dst (copy failed)"); return 1; }
-  rec f "$dst" "$(sha256sum "$dst" | cut -d' ' -f1)"
+  PH[$dst]=$(sha256sum "$dst" | cut -d' ' -f1)
+  rec f "$dst" "${PH[$dst]}"
   PLACED+=("$dst")
 }
 
@@ -184,9 +187,10 @@ for e in "${KIT[@]}"; do
 done
 
 # Watch unit: ExecStart points at the bin directory used above.
+UNIT_PLACED=0
 UNIT_TMP=$(mktemp) || exit 1
 if sed "s|@BINDIR@|$BIN|g" "$SRC/omarchy-audio-watch.service" >"$UNIT_TMP"; then
-  put_file "$UNIT_TMP" "$UNIT_DIR/$UNIT_NAME" 0644
+  put_file "$UNIT_TMP" "$UNIT_DIR/$UNIT_NAME" 0644 && UNIT_PLACED=1
 else
   FAILED+=("$UNIT_DIR/$UNIT_NAME (cannot read the unit template)")
 fi
@@ -194,25 +198,47 @@ rm -f "$UNIT_TMP"
 
 put_file "$SRC/SKILL.md" "$SKILL_DIR/SKILL.md" 0644
 
-# Modules: copied as they are, then detect && enable for each.
+# Modules: copied as they are, then detect && enable for each. A module's hooks run only when this
+# run placed every one of its files (none skipped as foreign, none failed): a hook that was already
+# there and not ours is never executed. Each module this run placed fully gets an m line.
 MODS=()
+declare -A MODBAD=()
 if [ -d "$SRC/modules" ]; then
-  while IFS= read -r -d '' p; do
-    rel=${p#"$SRC/modules/"}
-    if [ -d "$p" ]; then mkd "$MOD_DST/$rel"
-    elif [ -f "$p" ]; then put_file "$p" "$MOD_DST/$rel" "$(stat -c %a "$p")"
-    fi
-  done < <(find "$SRC/modules" -mindepth 1 \( -name __pycache__ -prune \) -o -print0 | sort -z)
-  for m in "$SRC"/modules/*/; do [ -d "$m" ] && MODS+=("$(basename "$m")"); done
+  if [ -L "$MOD_DST" ] || { [ -e "$MOD_DST" ] && [ ! -d "$MOD_DST" ]; }; then
+    SKIPPED+=("$MOD_DST (exists and is not a plain directory; modules not installed)")
+    for m in "$SRC"/modules/*/; do [ -d "$m" ] && MODBAD[$(basename "$m")]="destination $MOD_DST is not a plain directory"; done
+  else
+    while IFS= read -r -d '' p; do
+      rel=${p#"$SRC/modules/"}
+      mod=; case $rel in */*) mod=${rel%%/*} ;; *) [ -d "$p" ] && mod=$rel ;; esac
+      dst=$MOD_DST/$rel
+      if [ -d "$p" ]; then
+        if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -d "$dst" ]; }; then
+          SKIPPED+=("$dst (exists and is not a plain directory, not placed by this installer)")
+          [ -n "$mod" ] && MODBAD[$mod]="$dst is not a plain directory"
+        else
+          mkd "$dst" || { [ -n "$mod" ] && MODBAD[$mod]="cannot create $dst"; }
+        fi
+      elif [ -f "$p" ]; then
+        put_file "$p" "$dst" "$(stat -c %a "$p")" || { [ -n "$mod" ] && MODBAD[$mod]="$dst was not placed"; }
+      fi
+    done < <(find "$SRC/modules" -mindepth 1 \( -name __pycache__ -prune \) -o -print0 | sort -z)
+  fi
+  for m in "$SRC"/modules/*/; do
+    [ -d "$m" ] || continue
+    name=$(basename "$m"); MODS+=("$name")
+    [ -z "${MODBAD[$name]+x}" ] && rec m "$MOD_DST/$name" "$name"
+  done
 fi
 
 rec b "$BIN"
 # Write the manifest (deduplicated, directories kept from earlier runs).
 mkd "$KIT_DATA" || { echo "install.sh: cannot create $KIT_DATA" >&2; exit 1; }
 # Entries from an earlier run that this run did not rewrite stay, so uninstall still finds them.
-if ! { { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$1 FS $2]=1; next } $1!="b" && !(($1 FS $2) in seen)' "$NEW" "$MANIFEST"; } \
-       | sort -u >"$MANIFEST.tmp" && mv -f "$MANIFEST.tmp" "$MANIFEST"; }; then
-  rm -f "$MANIFEST.tmp"
+MTMP=$(mktemp "$KIT_DATA/.install-manifest.XXXXXX") || MTMP=
+if [ -z "$MTMP" ] || ! { { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$1 FS $2]=1; next } $1!="b" && !(($1 FS $2) in seen)' "$NEW" "$MANIFEST"; } \
+       | sort -u >"$MTMP" && chmod 0644 "$MTMP" && mv -f "$MTMP" "$MANIFEST"; }; then
+  [ -n "$MTMP" ] && rm -f "$MTMP"
   echo "install.sh: FAILED to write the manifest $MANIFEST; uninstall.sh cannot find what was placed:" >&2
   for p in "${PLACED[@]}"; do echo "  $p" >&2; done
   exit 1
@@ -237,16 +263,27 @@ if [ ${#MODS[@]} -eq 0 ]; then echo "  none in this checkout"; fi
 ENABLED=0
 # Contract: every hook gets XDG_BIN_HOME = the bin dir the kit commands went to (also with --bindir).
 HOOK_ENV=(XDG_BIN_HOME="$BIN")
+hook_ours() {   # hook_ours PATH: 0 when this run placed PATH and it still has the hash recorded for it
+  [ -n "${PH[$1]+x}" ] && [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ] \
+    && [ "$(sha256sum "$1" | cut -d' ' -f1)" = "${PH[$1]}" ]
+}
 for name in "${MODS[@]}"; do
   m=$MOD_DST/$name
-  if [ ! -x "$m/detect" ]; then echo "  $name: no executable detect, skipped"; continue; fi
+  if [ -n "${MODBAD[$name]+x}" ]; then
+    echo "  $name: NOT run: ${MODBAD[$name]} (see 'Not placed' above); its hooks are not ours to execute"
+    continue
+  fi
+  if [ ! -f "$SRC/modules/$name/detect" ]; then echo "  $name: no detect, skipped"; continue; fi
+  if ! hook_ours "$m/detect"; then echo "  $name: NOT run: $m/detect is not the file this run placed"; FAILED+=("$m/detect (changed after copy, not run)"); continue; fi
   out=$(env "${HOOK_ENV[@]}" timeout 30 "$m/detect" 2>&1); rc=$?
   if [ $rc -ne 0 ]; then echo "  $name: device not present, not enabled${out:+ ($out)}"; continue; fi
-  if [ ! -x "$m/enable" ]; then echo "  $name: detected, but it has no executable enable"; continue; fi
+  if [ ! -f "$SRC/modules/$name/enable" ]; then echo "  $name: detected, but it has no enable"; continue; fi
+  if ! hook_ours "$m/enable"; then echo "  $name: NOT run: $m/enable is not the file this run placed"; FAILED+=("$m/enable (changed after copy, not run)"); continue; fi
   out=$(env "${HOOK_ENV[@]}" timeout 60 "$m/enable" 2>&1); rc=$?
-  echo "  $name: detected, enable exit $rc"
+  # Contract: a module never makes an install fail; a non-zero enable is a printed note.
+  if [ $rc -eq 0 ]; then echo "  $name: detected, enabled"; ENABLED=1
+  else echo "  $name: detected, enable exit $rc (note only: the kit installed; run '$m/status' to see what is in place)"; fi
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/    /'
-  [ $rc -eq 0 ] && ENABLED=1
 done
 if [ $ENABLED = 1 ]; then
   echo "  New PipeWire configuration takes effect at the next PipeWire start. Nothing in this kit restarts PipeWire."
@@ -254,7 +291,7 @@ fi
 echo
 
 echo "Watch service ($UNIT_NAME):"
-if ! grep -qF $'f\t'"$UNIT_DIR/$UNIT_NAME"$'\t' "$MANIFEST"; then
+if [ $UNIT_PLACED = 0 ]; then
   echo "  not placed (see above); systemd left alone"
 elif sd_reads_unit_dir; then
   systemctl --user daemon-reload || FAILED+=("systemctl --user daemon-reload failed")
@@ -282,8 +319,9 @@ fi
 echo
 
 echo "Your data (results, logs) goes to $STATE; uninstall.sh never deletes it."
-[ $DEPS_OK = 0 ] || echo "Some required tools are missing: see Dependencies above."
+[ $DEPS_OK = 0 ] || FAILED+=("required tools missing (see Dependencies above); the kit is installed but will not work until they are")
 if [ ${#FAILED[@]} -gt 0 ] || [ ${#SKIPPED[@]} -gt 0 ]; then
+  if [ $DEPS_OK != 0 ]; then echo "Some required tools are missing: see Dependencies above."; fi
   echo "Install INCOMPLETE: ${#FAILED[@]} failed, ${#SKIPPED[@]} left alone (listed above). Exit 1."
   echo "What was placed is in the manifest; $SRC/uninstall.sh removes it."
   exit 1

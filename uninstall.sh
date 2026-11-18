@@ -41,7 +41,10 @@ unit_file=$(awk -F'\t' -v u="$UNIT_DIR/$UNIT_NAME" '$1=="f" && $2==u {print $2}'
 SD=0
 if [ -n "$unit_file" ]; then
   frag=$(systemctl --user show -p FragmentPath --value "$UNIT_NAME" 2>/dev/null) || frag=
-  if [ -n "$frag" ] && [ "$frag" = "$unit_file" ]; then
+  want=$(awk -F'\t' -v u="$unit_file" '$1=="f" && $2==u {print $3}' "$MANIFEST")
+  if [ -n "$frag" ] && [ "$frag" = "$unit_file" ] && [ -f "$unit_file" ] && [ "$(sha256sum "$unit_file" | cut -d' ' -f1)" != "$want" ]; then
+    echo "Watch service: $unit_file changed since install; not yours to stop through this script, systemctl not called"
+  elif [ -n "$frag" ] && [ "$frag" = "$unit_file" ]; then
     SD=1
     if out=$(systemctl --user disable --now "$UNIT_NAME" 2>&1); then echo "Watch service: stopped and disabled"
     else echo "Watch service: FAILED to stop and disable it"; FAILED+=("systemctl --user disable --now $UNIT_NAME failed"); fi
@@ -57,22 +60,37 @@ BIN=$(awk -F'\t' '$1=="b" {b=$2} END {print b}' "$MANIFEST")
 BIN=${BIN:-$HOME/.local/bin}
 # A module whose disable fails keeps its installed copy (and the manifest stays), so running
 # uninstall.sh again retries that disable instead of stranding what enable placed.
-KEEP_MODS=()
-if [ -d "$MOD_DST" ]; then
-  for m in "$MOD_DST"/*/; do
-    [ -d "$m" ] || continue
-    m=${m%/}; name=$(basename "$m")
-    if [ -x "$m/disable" ]; then
-      out=$(env XDG_BIN_HOME="$BIN" timeout 60 "$m/disable" 2>&1); rc=$?
-      echo "Module $name: disable exit $rc"
-      [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
-      if [ $rc -ne 0 ]; then
-        FAILED+=("module $name: disable exit $rc; kept $m so uninstall.sh can run it again")
-        KEEP_MODS+=("$m")
-      fi
-    else
-      echo "Module $name: no executable disable, nothing run"
-    fi
+# Only modules install.sh recorded (m lines) are touched, and a disable runs only when it is still the
+# exact file install.sh placed (its f line hash). Anything else under the module directory is not ours:
+# it is never executed and is listed as left in place.
+KEEP_MODS=() kept=()
+declare -A OURS=()
+while IFS=$'\t' read -r t p x; do
+  [ "$t" = m ] && [ -n "${p:-}" ] || continue
+  OURS[$p]=1
+  name=${x:-$(basename "$p")}
+  hook=$p/disable
+  want=$(awk -F'\t' -v h="$hook" '$1=="f" && $2==h {print $3}' "$MANIFEST")
+  if [ -z "$want" ]; then echo "Module $name: install.sh placed no disable, nothing run"; continue; fi
+  if [ ! -f "$hook" ] || [ -L "$hook" ] || [ ! -x "$hook" ] || [ "$(sha256sum "$hook" | cut -d' ' -f1)" != "$want" ]; then
+    echo "Module $name: disable NOT run: $hook is missing or changed since install"
+    FAILED+=("module $name: $hook is not the file install.sh placed, so it was not run and what enable placed may still be there; run install.sh again (it restores the hook), then uninstall.sh")
+    KEEP_MODS+=("$p")
+    continue
+  fi
+  out=$(env XDG_BIN_HOME="$BIN" timeout 60 "$hook" 2>&1); rc=$?
+  echo "Module $name: disable exit $rc"
+  [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+  if [ $rc -ne 0 ]; then
+    FAILED+=("module $name: disable exit $rc; kept $p and the manifest: fix the cause, then run uninstall.sh again")
+    KEEP_MODS+=("$p")
+  fi
+done <"$MANIFEST"
+if [ -d "$MOD_DST" ] && [ ! -L "$MOD_DST" ]; then
+  for d in "$MOD_DST"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    [ -n "${OURS[$d]+x}" ] || kept+=("$d/ (module directory install.sh did not place: not run, not removed)")
   done
 fi
 
@@ -83,7 +101,7 @@ in_kept_module() {
   for k in "${KEEP_MODS[@]}"; do case $1 in "$k"|"$k"/*) return 0 ;; esac; done
   return 1
 }
-removed=0 kept=()
+removed=0
 rm_one() {
   if rm -f "$1"; then removed=$((removed + 1)); echo "  removed $1"
   else FAILED+=("$1 (rm failed)"); fi
@@ -91,7 +109,7 @@ rm_one() {
 while IFS=$'\t' read -r t p x; do
   [ -n "${p:-}" ] || continue
   if under_state "$p"; then kept+=("$p (inside your data directory, never removed)"); continue; fi
-  if [ ${#KEEP_MODS[@]} -gt 0 ] && in_kept_module "$p"; then [ "$t" = d ] || kept+=("$p (its module's disable failed)"); continue; fi
+  if [ ${#KEEP_MODS[@]} -gt 0 ] && in_kept_module "$p"; then [ "$t" = d ] || kept+=("$p (its module's disable failed or was not run)"); continue; fi
   case $t in
     f)
       if [ -f "$p" ] && [ ! -L "$p" ]; then

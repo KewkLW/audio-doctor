@@ -31,7 +31,7 @@ No sudo, and it never installs packages. It places:
 - the device modules from `modules/` in `~/.local/share/audio-doctor/modules/`
 - a manifest of all of the above in `~/.local/share/audio-doctor/install-manifest`
 
-It honours `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. `--bindir DIR` puts the commands in DIR instead (the device modules are always told the bin dir, as `XDG_BIN_HOME`). If a file it wants to place already exists and was not placed by it, it leaves that file alone and says so (`--force` replaces it).
+It honours `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. `--bindir DIR` puts the commands in DIR instead (the device modules are always told the bin dir, as `XDG_BIN_HOME`). If a file it wants to place already exists and was not placed by it, it leaves that file alone, says so and exits 1 (`--force` replaces it). A module whose files were not all placed by this run is not run at all. If a required tool is missing it still installs, prints the package to add and exits 1.
 
 It ends with `Done.` and exit 0 only when everything was placed (and, with `--start`, the service really started). Otherwise it lists what failed or was left alone, says `Install INCOMPLETE` and exits 1; what it did place is in the manifest, so `./uninstall.sh` still removes it. `uninstall.sh` likewise exits 1 and keeps the manifest when a removal fails, so you can run it again.
 
@@ -61,7 +61,7 @@ The installer checks these and prints the package to install for anything missin
 ./uninstall.sh
 ```
 
-It stops and disables the watch service, runs each module's `disable`, then removes exactly the files in the manifest (the copied commands, their Python bytecode, the unit, the skill, the modules). A file you edited after install is kept and listed. Bytecode Python wrote later on its own (for example after a Python upgrade) is listed, not deleted. If a module's `disable` fails, that module's installed copy and the manifest stay and it exits 1; fix the cause and run `./uninstall.sh` again. It never deletes your results in `~/.local/state/omarchy-studio/` (audit reports, watch logs, footprints) or any report you saved elsewhere; it prints where they are so you can delete them yourself.
+It stops and disables the watch service, runs `disable` for each module it installed (only when that `disable` is still the file it placed; anything else under the modules directory is never run and is left in place), then removes exactly the files in the manifest (the copied commands, their Python bytecode, the unit, the skill, the modules). A file you edited after install is kept and listed. Bytecode Python wrote later on its own (for example after a Python upgrade) is listed, not deleted. If a module's `disable` fails or was changed, that module's installed copy and the manifest stay and it exits 1; fix the cause and run `./uninstall.sh` again. It never deletes your results in `~/.local/state/omarchy-studio/` (audit reports, watch logs, footprints) or any report you saved elsewhere; it prints where they are so you can delete them yourself.
 
 ## Testing the installer
 

@@ -6,7 +6,9 @@
 # placed path, run each installed command from the scratch bin, install again (idempotent),
 # uninstall.sh, and check that only the seeded user data is left. After the cycles: the failure
 # paths (a foreign file in the way, an unwritable bin dir, a failing `systemctl enable` through a
-# PATH shim) must give exit 1, never "Done".
+# PATH shim) must give exit 1, never "Done". Module hooks: only ones install.sh placed in that run (at
+# install) or recorded with a matching hash (at uninstall) are executed; a foreign module dir at install,
+# a user-added module dir and a tampered hook at uninstall are never run (proved with marker files).
 #
 # Plays no audio and opens no stream: audio-doctor runs as `--audit` (config only) and
 # omarchy-audio-audit, which starts a full measured run with a stream on any invocation, is only
@@ -264,6 +266,66 @@ touch "$S/fixed"
 out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
 [ $rc = 0 ] && echo "$out" | grep -q 'Module stuck: disable exit 0' && [ -z "$(find "$H" -mindepth 1)" ] \
   && ok "second uninstall after the fault is fixed: disable ran again, exit 0, nothing left" || { bad "retry uninstall: exit $rc"; echo "$out" | tail -8; find "$H" -mindepth 1; }
+rm -rf "$S"
+
+# Hooks the installer did not place are never executed. Each fake hook below touches a marker file
+# when it runs, so "not executed" is proven by the marker being absent, not by output alone.
+mk_src() {  # mk_src DIR: a copy of the checkout with no modules/
+  mkdir -p "$1"; (cd "$REPO" && git ls-files -z | xargs -0 cp --parents -t "$1"); rm -rf "$1/modules"
+}
+mk_mod() {  # mk_mod MODDIR TAG MARKDIR: detect exit 0, every hook touches MARKDIR/TAG-<hook>
+  mkdir -p "$1"
+  for h in detect enable disable status; do printf '#!/bin/sh\ntouch "%s/%s-%s"\nexit 0\n' "$3" "$2" "$h" >"$1/$h"; done
+  chmod +x "$1"/*
+}
+
+# (a) A foreign module dir already sits where install.sh would copy the module: its files are not
+#     overwritten, the module is reported, and neither the foreign nor the copied hooks run.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; MK=$S/marks; mkdir -p "$H" "$MK"; mk_src "$SRC"
+mk_mod "$SRC/modules/clash" ours "$MK"
+MD=$H/.local/share/audio-doctor/modules
+mk_mod "$MD/clash" foreign "$MK"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+echo "$out" | sed -n '/^Modules:/,/^$/p' | sed 's/^/    | /'
+[ $rc = 1 ] && echo "$out" | grep -q 'clash: NOT run' && [ -z "$(ls -A "$MK")" ] && grep -q foreign-detect "$MD/clash/detect" \
+  && ! grep -qP '^m\t' "$H/.local/share/audio-doctor/install-manifest" \
+  && ok "foreign module dir at install: exit 1, reported, files untouched, no m line, no hook executed (marker dir empty)" \
+  || { bad "foreign module at install: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; }
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ -z "$(ls -A "$MK")" ] && [ -x "$MD/clash/disable" ] && grep -q foreign-disable "$MD/clash/disable" \
+  && echo "$out" | grep -q "clash/ (module directory install.sh did not place" \
+  && ok "uninstall after it: foreign module not executed, not removed, listed" || { bad "foreign module at uninstall: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; }
+rm -rf "$S"
+
+# (b) A module dir the user added after install: uninstall lists it and never runs its disable.
+# (c) A hook install.sh placed, changed after install: uninstall does not run it, keeps the module and
+#     the manifest, exits 1; install.sh again restores it and the next uninstall finishes.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; MK=$S/marks; mkdir -p "$H" "$MK"; mk_src "$SRC"
+mk_mod "$SRC/modules/real" ours "$MK"
+MD=$H/.local/share/audio-doctor/modules
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 0 ] && [ -e "$MK/ours-detect" ] && [ -e "$MK/ours-enable" ] && grep -qP "^m\t$MD/real\t" "$H/.local/share/audio-doctor/install-manifest" \
+  && ok "own module: detect and enable ran from the copy this run placed, m line recorded" || { bad "own module install: exit $rc"; echo "$out" | tail -8; }
+rm -f "$MK"/*
+mk_mod "$MD/useradded" user "$MK"
+printf '#!/bin/sh\ntouch "%s/tampered-disable"\nexit 0\n' "$MK" >"$MD/real/disable"
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+echo "$out" | sed 's/^/    | /' | grep -E 'Module|useradded|FAILED|real' | head -12
+M=$H/.local/share/audio-doctor/install-manifest
+[ $rc = 1 ] && [ -z "$(ls -A "$MK")" ] && echo "$out" | grep -q 'real: disable NOT run' \
+  && echo "$out" | grep -q 'useradded/ (module directory install.sh did not place' && [ -x "$MD/useradded/disable" ] \
+  && [ -f "$M" ] && [ -f "$MD/real/detect" ] && [ ! -e "$H/.local/bin/whatis" ] \
+  && ok "user-added module and tampered hook: neither executed (marker dir empty), module and manifest kept, exit 1, the rest removed" \
+  || { bad "user-added/tampered at uninstall: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; }
+out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+rm -f "$MK"/*
+out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ -e "$MK/ours-disable" ] && [ ! -e "$MK/user-disable" ] && [ ! -e "$MK/tampered-disable" ] \
+  && [ "$(cd "$H" && find . -mindepth 1 -type f | sort | tr '\n' ' ')" = "$(cd "$H" && find ./.local/share/audio-doctor/modules/useradded -type f | sort | tr '\n' ' ')" ] \
+  && ok "after install.sh restored the hook: its own disable ran, the user module still not run and is all that is left" \
+  || { bad "retry after tamper: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; find "$H" -mindepth 1 -type f; }
 rm -rf "$S"
 
 AFTER=$(real_snapshot)
