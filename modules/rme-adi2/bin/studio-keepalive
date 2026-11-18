@@ -2,7 +2,8 @@
 # studio-keepalive on|off|status : keep the RME ADI-2 awake during automated tests with a fail-safe pulse.
 # `on` starts a background pulse: one read-only MIDI status query (`adi2 status`) every 60 s. It NEVER writes
 # device.auto_standby or any other device setting, so there is nothing to restore: when the pulse stops for any
-# reason (off, crash, kill -9, reboot) the device's own standby timer simply takes over again.
+# reason (off, crash, kill -9, reboot, or its own limit of KEEPALIVE_MAX_HOURS, default 8) the device's own standby
+# timer simply takes over again.
 # Known limit: while a program (a DAW) holds the ADI-2 MIDI port raw, the query cannot reach the device; the pulse
 # then records that line and `status` reports it and exits 1 instead of pretending to keep the device awake.
 # RME module piece (modules/rme-adi2): `enable` links it into the bin dir. With no ADI-2 on USB (absent, off or in
@@ -16,6 +17,7 @@ PIDF=$RUN/keepalive.pid
 LAST=$RUN/keepalive.last                                              # "<epoch> ok|fail <line>" of the last pulse
 OLD=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state  # left by the old set-and-restore version
 INTERVAL=${KEEPALIVE_INTERVAL:-60}
+MAXH=${KEEPALIVE_MAX_HOURS:-8}   # hard lifetime: a pulse nobody stopped (crashed caller) ends by itself after this
 
 present() { [ -x "$DETECT" ] && "$DETECT" >/dev/null 2>&1; }
 # the pulse: one read-only query. Kept in this one place so it follows whichever adi2 is on PATH.
@@ -29,7 +31,9 @@ old_note() { [ -s "$OLD" ] && echo "note: old keepalive.state found (saved auto_
 case "${1:-status}" in
   _pulse)  # the background loop; started by `on`
     trap 'kill $! 2>/dev/null; rm -f "$PIDF"; exit 0' TERM INT
+    end=$(( $(date +%s) + MAXH * 3600 ))
     while present; do
+      [ "$(date +%s)" -lt "$end" ] || { echo "$(date +%s) expired pulse ran ${MAXH} h and stopped by itself" > "$LAST"; rm -f "$PIDF"; exit 0; }
       if line=$(pulse_once); then echo "$(date +%s) ok" > "$LAST"
       else echo "$(date +%s) fail ${line:-adi2 status failed}" > "$LAST"; fi
       sleep "$INTERVAL" & wait $!
@@ -45,7 +49,7 @@ case "${1:-status}" in
     echo "$(date +%s) ok" > "$LAST"
     setsid "$SELF" _pulse </dev/null >/dev/null 2>&1 &
     echo $! > "$PIDF"
-    echo "keepalive on: MIDI status pulse every ${INTERVAL} s (pid $!); no device setting changed, stop with: studio-keepalive off"
+    echo "keepalive on: MIDI status pulse every ${INTERVAL} s for at most ${MAXH} h (pid $!); no device setting changed, stop with: studio-keepalive off"
     old_note
     ;;
   off)
@@ -64,7 +68,7 @@ case "${1:-status}" in
       if [ "${res:-}" = ok ]; then echo "ADI-2 on USB, keepalive on: pulse pid $p, last reply ${age} s ago"
       else echo "ADI-2 on USB, keepalive on but NOT keeping it awake: ${rest:-no pulse yet} (${age} s ago)"; rc=1; fi
     else
-      echo "ADI-2 on USB, keepalive off (its own standby timer applies)"
+      echo "ADI-2 on USB, keepalive off (its own standby timer applies)$(read -r _ r m < "$LAST" 2>/dev/null; case "${r:-}" in expired|gone) echo "; last pulse: $m";; esac)"
     fi
     old_note
     exit $rc
