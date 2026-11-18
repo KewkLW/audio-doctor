@@ -9,8 +9,8 @@
 # PATH shim) must give exit 1, never "Done".
 #
 # Plays no audio and opens no stream: audio-doctor runs as `--audit` (config only) and
-# omarchy-audio-audit, which starts a full measured run with a stream whenever main() runs, is
-# loaded from its installed path up to the main() guard (imports and definitions run, main() does not).
+# omarchy-audio-audit, which starts a full measured run with a stream on any invocation, is only
+# checked as installed, executable and parsing (Conductor ruling under the audio hold).
 # It never calls the real systemctl with a write verb: the scratch unit dir is not on the user
 # manager's path, so install.sh and uninstall.sh leave systemd alone; the --start test uses a shim.
 set -u
@@ -89,18 +89,14 @@ for c in $(seq 1 "$CYCLES"); do
   run footprint 'compare'
   run config-audit 'config audit: [0-9]+ drop-ins read'
   run audio-doctor 'config audit: [0-9]+ drop-ins read' --audit
-  # omarchy-audio-audit has no --help or dry mode: any invocation of main() starts a measured run that
-  # opens a playback stream, and the audio hold (Conductor ruling) forbids that. So the installed file is
-  # executed by the installed path up to its `if __name__ == "__main__"` guard: every import, constant
-  # and definition runs, main() does not. Logged as a GAP (no --help); see the bounty evidence.
-  o=$("${E[@]}" timeout 30 python3 -I -B -c '
-import runpy, sys
-g = runpy.run_path(sys.argv[1], run_name="install_smoke")
-assert callable(g.get("main")), "no main()"
-print("loaded", sys.argv[1], "main() present, not called")' "$H/.local/bin/omarchy-audio-audit" 2>&1); r=$?
-  if [ $r = 0 ] && [ -x "$H/.local/bin/omarchy-audio-audit" ]; then
-    ok "omarchy-audio-audit: executable, module code ran from the installed path, main() not called (audio hold): $(echo "$o" | sed "s|$H|~|")"
-  else bad "omarchy-audio-audit failed to load (exit $r)"; echo "$o" | tail -5 | sed 's/^/      /'; fi
+  # omarchy-audio-audit: parse-only by Conductor ruling (criterion 3 exception). It has no --help or
+  # dry mode: any run starts a measured run that opens a playback stream, which the audio hold forbids.
+  # So it is checked as installed, executable and parsing as Python; it is not executed. The missing
+  # --help is a GAP filed as its own bounty.
+  if [ -x "$H/.local/bin/omarchy-audio-audit" ] && head -1 "$H/.local/bin/omarchy-audio-audit" | grep -q python3 \
+     && "${E[@]}" python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$H/.local/bin/omarchy-audio-audit"; then
+    ok "omarchy-audio-audit installed, executable, parses (not run: every run opens a playback stream; audio hold)"
+  else bad "omarchy-audio-audit missing, not executable or does not parse"; fi
 
   # Bytecode next to the commands must all come from install.sh (it is in the manifest).
   stray_pyc=$(find "$H/.local/bin" -path '*/__pycache__/*' -type f | grep -vxF -f <(awk -F'\t' '$1=="f" {print $2}' "$M"))

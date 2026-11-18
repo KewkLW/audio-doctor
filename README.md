@@ -69,7 +69,7 @@ It stops and disables the watch service, runs each module's `disable`, then remo
 tests/install-roundtrip.sh [cycles]
 ```
 
-Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is loaded up to its main entry point but not run, since every run opens a playback stream), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with fake modules (including one whose `disable` fails), and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
+Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is only checked to parse, since every run opens a playback stream), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with fake modules (including one whose `disable` fails), and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
 
 ## What the kit changes on your system
 
