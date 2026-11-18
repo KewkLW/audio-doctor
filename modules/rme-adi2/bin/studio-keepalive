@@ -7,7 +7,7 @@
 # standby) every subcommand prints one neutral line and exits 0: a missing device is not a failure here.
 set -u
 DETECT=$(dirname "$(realpath "$0")")/../detect
-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state
 mkdir -p "$(dirname "$STATE")"
 
 present() { [ -x "$DETECT" ] && "$DETECT" >/dev/null 2>&1; }
@@ -36,7 +36,12 @@ case "${1:-status}" in
     else echo "keepalive: restore to '$saved' not confirmed (DAW holding MIDI?); state kept"; exit 3; fi
     ;;
   *)
-    present && echo "ADI-2 on USB, auto_standby = $(get || echo '?')" || echo "no RME ADI-2: module off"
+    if ! present; then
+      [ -s "$STATE" ] && echo "no RME ADI-2: module off (saved auto_standby '$(cat "$STATE")' is restored by the next off)" \
+                      || echo "no RME ADI-2: module off"
+      exit 0
+    fi
+    echo "ADI-2 on USB, auto_standby = $(get || echo '?')"
     [ -s "$STATE" ] && echo "keepalive active, will restore: $(cat "$STATE")" || echo "keepalive not active"
     ;;
 esac
