@@ -179,8 +179,9 @@ def silent(v):
     return v is None or v == float("-inf") or v < SILENT_DB
 
 # ------------------------------------------------------------------ RME ADI-2
-def rme_check(hw):
-    if not any("ADI-2" in c["desc"] for c in hw["alsa_cards"]) or not shutil.which("adi2"):
+def rme_check(hw, present):
+    """Only when modules/rme-adi2/detect says the ADI-2 is on USB (standby = absent)."""
+    if not present or not any("ADI-2" in c["desc"] for c in hw["alsa_cards"]) or not shutil.which("adi2"):
         return None
     try:
         state = json.loads(run(["adi2", "dump", "--json"], timeout=12) or "{}")
@@ -219,8 +220,9 @@ def main():
         sys.argv = [sys.argv[0]] + (["--json"] if JSON else []) + (["--fix"] if FIX else [])
         return confaudit.main()
     fixed = []
+    rme_on = confaudit.rme_present()
     if FIX:  # relink first so the measured report shows the repaired graph
-        fixed = [f for f in confaudit.audit(fix=True)[0] if f["check"] == "live"]
+        fixed = [f for f in confaudit.audit(fix=True, rme=rme_on)[0] if f["check"] == "live"]
         time.sleep(0.5)
     svc = services()
     hw = hardware()
@@ -231,7 +233,7 @@ def main():
         wbox["ctx"], wbox["apps"] = ctx, whatis.survey_audio(ctx)
     wt = threading.Thread(target=_whatis); wt.start()
     cbox = {}
-    ct = threading.Thread(target=lambda: cbox.update(f=confaudit.audit(dump)[0])); ct.start()
+    ct = threading.Thread(target=lambda: cbox.update(f=confaudit.audit(dump, rme=rme_on)[0])); ct.start()
     defaults = nodes.pop("_defaults", {})
     def_sink = run(["pactl", "get-default-sink"]).strip() or defaults.get("default.audio.sink")
     sinks = {s["name"]: s for s in pactl_json("sinks")}
@@ -324,7 +326,7 @@ def main():
         tone_proc = sp.Popen(["pw-play", "--target", def_sink, tf], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
         time.sleep(0.4)
     rme_box = {}
-    rt = threading.Thread(target=lambda: rme_box.update(r=rme_check(hw))); rt.start()
+    rt = threading.Thread(target=lambda: rme_box.update(r=rme_check(hw, rme_on))); rt.start()
     levels = meter(targets)
     if tone_proc:
         tone_proc.terminate()
@@ -347,6 +349,9 @@ def main():
         v = sink_info[n]["volume_pct"]
         if v is not None and v <= 2: find("BREAK", "sink", f"sink '{s.get('description')}' volume is {v}%", f"pactl set-sink-volume {n} 50%")
         if n in hops and not hops[n]:
+            out_tgt = (by_name.get(n + ".out") or {}).get("props", {}).get("target.object")
+            if not rme_on and confaudit.is_rme(out_tgt):
+                continue  # RME loopback waiting for the ADI-2 (off USB / standby): the module is off, not a break
             find("BREAK", "routing", f"virtual sink '{s.get('description')}' is not linked to any hardware sink", "device off/unplugged/renamed? if it is back: audio-doctor --fix (relinks); see the config findings")
 
     # stream verdicts
@@ -395,12 +400,14 @@ def main():
     ct.join()
     have_live = {f["message"] for f in fixed}
     findings.extend(fixed)
-    findings.extend(f for f in cbox.get("f", []) if f["message"] not in have_live)
+    # the RME-off line is printed once below, not as a finding
+    findings.extend(f for f in cbox.get("f", []) if f["message"] not in have_live and f["message"] != confaudit.RME_OFF)
 
     order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
     findings.sort(key=lambda f: order[f["severity"]])
     report = {"took_s": round(time.time() - t0, 1), "default_sink": def_sink, "services": svc, "hardware": hw,
-              "sinks": sink_info, "streams": streams, "apps": apps, "rme": rme, "findings": findings}
+              "sinks": sink_info, "streams": streams, "apps": apps, "rme": rme,
+              "rme_module": "on" if rme_on else "off", "findings": findings}
     if JSON:
         print(json.dumps(report, indent=1, default=str)); return
     breaks = [f for f in findings if f["severity"] == "BREAK"]
@@ -423,6 +430,10 @@ def main():
     for a in shown:
         state = "STREAMING" if a["has_stream"] else "pipewire client" if a["pw_client"] else "NO pipewire client"
         print(f"  {a['label'][:30]:30} {a['runtime']:16} pid {a['pid']:<8} started {a['start_str'][5:16] if a['start_str'] else '?':11} {state}{'  STALE' if a['stale'] else ''}")
+    if not rme_on:
+        print("\n" + confaudit.RME_OFF)
+    elif not shutil.which("adi2"):
+        print("\nRME ADI-2: on USB; adi2 not installed, device state not read")
     if rme:
         st = rme["status"]
         print(f"\nRME ADI-2: mode {rme['basic_mode']}, knob/line vol {rme['line']['volume']} dB, mute {rme['line']['mute']}, source {rme['line']['source']}, "

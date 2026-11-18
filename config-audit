@@ -47,6 +47,26 @@ def run(cmd, timeout=8):
         return sp.CompletedProcess(cmd, 1, "", str(e))
 
 
+def rme_present():
+    """RME module contract: the kit decides its RME rows at run time through modules/rme-adi2/detect
+    (next to this script in a checkout, else the installed kit copy). No module = RME off.
+    Standby drops the ADI-2 off USB, so it counts as absent."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+    for d in (os.path.join(here, "modules", "rme-adi2", "detect"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "detect")):
+        if os.access(d, os.X_OK):
+            return run([d], timeout=5).returncode == 0
+    return False
+
+
+RME_OFF = "no RME ADI-2: module off"
+
+
+def is_rme(name):
+    return isinstance(name, str) and "RME_ADI-2" in name
+
+
 def truthy(v):
     return v is True or str(v).lower() in ("true", "1", "yes")
 
@@ -191,8 +211,10 @@ def relink_cmds(nodes, ports, sid, tid):
 
 
 # ------------------------------------------------------------------ audit
-def audit(dump=None, fix=False):
+def audit(dump=None, fix=False, rme=None):
     findings = []
+    rme = rme_present() if rme is None else rme
+    rme_skipped = False
 
     def find(sev, check, msg, fix_="", where=""):
         findings.append({"severity": sev, "hop": "routing" if check == "live" else "config", "check": check, "message": msg, "fix": fix_, "file": where})
@@ -232,8 +254,10 @@ def audit(dump=None, fix=False):
             find("WARN", "fallback", f"'{name}' has node.dont-fallback without node.linger: WirePlumber destroys it while '{tgt}' is missing",
                  "add node.linger = true", f)
 
-        # target present? if not, why
-        if isinstance(tgt, str) and tgt not in by_name:
+        # target present? if not, why. An RME target with the RME off USB is the module being off, not a fault.
+        if isinstance(tgt, str) and tgt not in by_name and is_rme(tgt) and not rme:
+            rme_skipped = True
+        elif isinstance(tgt, str) and tgt not in by_name:
             m = re.match(r"alsa_(?:output|input)\.(.+)\.([^.]+)$", tgt)
             why = "device absent (off, unplugged or renamed)"
             if m:
@@ -291,6 +315,8 @@ def audit(dump=None, fix=False):
         else:
             find("BREAK", "live", msg, ("audio-doctor --fix  (runs: " + " ; ".join(" ".join(c) for c in cmds) + ")") if cmds else "relink it in qpwgraph")
 
+    if rme_skipped:
+        find("INFO", "rme", RME_OFF, "", "")
     return findings, [short(f) for _, f in files]
 
 

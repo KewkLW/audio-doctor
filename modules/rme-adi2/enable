@@ -1,0 +1,33 @@
+#!/bin/bash
+# enable: put the RME pieces in place (WirePlumber pro-audio rule, PipeWire stereo loopbacks, studio-keepalive).
+# Safe to run twice. Never overwrites a file it did not place: such a file is left as it is and reported.
+# Records what it placed (with checksums) so disable removes exactly that. Exit 0 = every piece in place.
+. "$(dirname "$(realpath "$0")")/lib.sh" || { echo "rme-adi2 enable: cannot read lib.sh"; exit 1; }
+rc=0
+# the manifest directory itself, recorded once it exists
+mdirs=(); d=$(dirname "$MANIFEST"); while [ ! -d "$d" ]; do mdirs+=("$d"); d=$(dirname "$d"); done
+mkdir -p "$(dirname "$MANIFEST")" || { echo "rme-adi2: cannot create $(dirname "$MANIFEST")"; exit 1; }
+for d in "${mdirs[@]}"; do man_put "dir:$d" dir "$d" - || { echo "rme-adi2: cannot write $MANIFEST"; exit 1; }; done
+while IFS='|' read -r name kind src dest; do
+  if ours "$name"; then echo "$name: already placed by this module: $dest"; continue; fi
+  if { [ -e "$dest" ] || [ -L "$dest" ]; } && [ -n "$(man_get "$name")" ]; then
+    echo "$name: $dest changed since enable placed it: left as it is"; continue
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    echo "$name: $dest already exists and was not placed by this module: left as it is"; continue
+  fi
+  want=$(render "$kind" "$src") || {
+    echo "$name: NOT placed: cannot read the unit's USB serial (device off USB, or no udev); run enable again with the RME awake"
+    rc=1; continue; }
+  mkd "$(dirname "$dest")" || { echo "$name: NOT placed: cannot create $(dirname "$dest")"; rc=1; continue; }
+  if [ "$kind" = link ]; then
+    ln -s "$want" "$dest" && man_put "$name" "$kind" "$dest" "$want" \
+      && echo "$name: placed $dest -> $want" || { echo "$name: NOT placed: link failed"; rm -f "$dest"; rc=1; }
+  else
+    printf '%s\n' "$want" >"$dest.rme-adi2.tmp" && mv -f "$dest.rme-adi2.tmp" "$dest" && man_put "$name" "$kind" "$dest" "$(sum_of "$dest")" \
+      && echo "$name: placed $dest" || { echo "$name: NOT placed: write failed"; rm -f "$dest.rme-adi2.tmp"; rc=1; }
+  fi
+done < <(pieces)
+adi2_line
+echo "$RESTART_NOTE"
+exit $rc

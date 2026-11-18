@@ -1,0 +1,30 @@
+#!/bin/bash
+# disable: remove exactly what enable placed, nothing else. Safe to run twice.
+# A placed file that was changed since enable is kept (it is someone's edit now) and reported.
+. "$(dirname "$(realpath "$0")")/lib.sh" || { echo "rme-adi2 disable: cannot read lib.sh"; exit 1; }
+rc=0
+[ -s "$MANIFEST" ] || { echo "rme-adi2: nothing placed by this module, nothing to remove"; exit 0; }
+mapfile -t recs <"$MANIFEST"
+dirs=()
+for rec in "${recs[@]}"; do
+  IFS=$'\t' read -r name kind dest val <<<"$rec"
+  [ -n "$name" ] || continue
+  [ "$kind" = dir ] && { dirs+=("$dest"); continue; }
+  if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+    echo "$name: $dest already gone"; man_del "$name" || rc=1
+  elif ours "$name"; then
+    rm -f "$dest" && echo "$name: removed $dest" && man_del "$name" || { echo "$name: could not remove $dest"; rc=1; }
+  else
+    echo "$name: $dest changed since enable placed it: left as it is (remove it by hand if unwanted)"; man_del "$name" || rc=1
+  fi
+done
+# directories enable created: only once every file is handled, deepest first, only when empty
+if [ ${#dirs[@]} -gt 0 ] && [ $rc = 0 ]; then
+  rm -f "$MANIFEST"
+  while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    rmdir "$d" 2>/dev/null && echo "dir: removed $d" || echo "dir: kept $d (not empty: holds files enable did not place)"
+  done < <(printf '%s\n' "${dirs[@]}" | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)
+fi
+echo "$RESTART_NOTE"
+exit $rc

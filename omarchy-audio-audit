@@ -42,6 +42,7 @@ ARGS = sys.argv[1:]
 def opt(name, default=None):
     return ARGS[ARGS.index(name) + 1] if name in ARGS and ARGS.index(name) + 1 < len(ARGS) else default
 
+RME_ON = False  # set in main() from modules/rme-adi2/detect
 STATE = os.path.expanduser("~/.local/state/omarchy-studio/audit")
 STRESS = ["stress-ng", "--cpu", "0", "--cpu-load", "70", "--vm", "2", "--vm-bytes", "512M"]
 STRESS_LABEL = "synthetic: stress-ng --cpu <all> --cpu-load 70 --vm 2 --vm-bytes 512M (about load average 22 on 32 threads, close to typical agent load; NOT real agent load)"
@@ -52,6 +53,21 @@ def run(cmd, timeout=15, **kw):
         return sp.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
     except Exception as e:
         return sp.CompletedProcess(cmd, 1, "", str(e))
+
+
+RME_OFF = "no RME ADI-2: module off"
+
+
+def rme_present():
+    """RME module contract: RME rows are decided at run time by modules/rme-adi2/detect (next to this
+    script in a checkout, else the installed kit copy). No module = off. Standby drops it off USB = absent."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    for d in (os.path.join(here, "modules", "rme-adi2", "detect"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "detect")):
+        if os.access(d, os.X_OK):
+            return run([d], timeout=5).returncode == 0
+    return False
 
 
 def rd(path, default=""):
@@ -176,7 +192,8 @@ def interface_chain(dump):
     if hw:
         m = re.match(r"alsa_output\.(.+)\.[^.]+$", hw)
         card = m[1] if m else hw
-    return {"default_sink": default, "hardware_sink": hw, "card": card,
+    waits = (nodes.get(by_name.get(default + ".out")) or {}).get("target.object") if default else None
+    return {"default_sink": default, "hardware_sink": hw, "card": card, "waits_for": waits,
             "description": next((p.get("node.description") for p in nodes.values() if p.get("node.name") == hw), hw)}
 
 
@@ -371,7 +388,9 @@ def power_settings(dump, chain):
             m = re.search(r"EEE status: (\w+)", eee)
             add("Network", f"Energy-Efficient Ethernet ({i})", m[1] if m else "unknown (ethtool not installed)", "measure",
                 "Only matters for network audio (AES67/Dante/streaming).")
-    if shutil.which("adi2") and "2a39:" in run(["lsusb"]).stdout:
+    if RME_ON and not shutil.which("adi2"):
+        add("Device", "RME ADI-2 auto-standby", "adi2 not installed", "measure", "Install adi2 (adi2-control) to read and set it.")
+    if RME_ON and shutil.which("adi2"):
         m = re.search(r"=\s*(\S+)", run(["adi2", "get", "device.auto_standby"]).stdout)
         st = m[1] if m else "?"
         add("Device", "RME ADI-2 auto-standby", st if st != "?" else "unreadable (a DAW holds its MIDI port?)", "keep" if st == "off" else ("measure" if st == "?" else "change"),
@@ -605,6 +624,9 @@ def main():
     if "--root-helper" in ARGS:
         return root_helper(opt("--root-helper"), opt("--rtla"), opt("--user"))
     t0 = time.time()
+    global RME_ON
+    RME_ON = rme_present()
+    if not RME_ON: print(RME_OFF, flush=True)
     quick = "--quick" in ARGS
     ct_s, tl_s, hold_s = (15, 10, 10) if quick else (40, 30, 30)
     loads = (opt("--loads") or "idle,stress").split(",")
@@ -630,7 +652,10 @@ def main():
     emit(f"audio audit {rid}: interface {chain.get('description')} ({chain.get('hardware_sink')}), rate {rate}, loads {loads}")
     emit(f"  results: {outdir}")
     sweep_block = None
-    if not chain.get("hardware_sink"):
+    if not chain.get("hardware_sink") and not RME_ON and "RME_ADI-2" in str(chain.get("waits_for") or ""):
+        notes.append(RME_OFF + ": the default output waits for the ADI-2 (off USB or in standby): buffer sweep skipped.")
+        sweep_block = "skipped: " + RME_OFF
+    elif not chain.get("hardware_sink"):
         notes.append("No hardware output found behind the default sink (routing broken? run audio-doctor --fix): buffer sweep skipped.")
         sweep_block = "skipped: no hardware output behind the default sink"
     if jack and not daw:
@@ -641,7 +666,7 @@ def main():
     if daw:
         sweep_block = "skipped in DAW mode (sizes are never changed while a DAW is connected)"
     json.dump(json.loads(run(["audio-doctor", "--json"], timeout=30).stdout or "{}"), open(f"{outdir}/raw/audio-doctor-before.json", "w"), indent=1)
-    ka = shutil.which("studio-keepalive") and not jack
+    ka = RME_ON and shutil.which("studio-keepalive") and not jack
     if ka:
         emit("  " + run(["studio-keepalive", "on"]).stdout.strip())
 

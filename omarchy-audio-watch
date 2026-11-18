@@ -51,7 +51,20 @@ def nvmes():
                        "pm_qos_us": rd(f"{c}/power/pm_qos_latency_tolerance_us")}
     return out
 
+def rme_present():
+    """RME module contract: RME rows only when modules/rme-adi2/detect (next to this script, else the
+    installed kit copy) says the ADI-2 is on USB. No module = off; standby = absent."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    for d in (os.path.join(here, "modules", "rme-adi2", "detect"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "detect")):
+        if os.access(d, os.X_OK):
+            try: return sp.run([d], capture_output=True, timeout=5).returncode == 0
+            except Exception: return False
+    return False
+
 def pw_errs():
+    rme = rme_present()
     o = run(["pw-top", "-b", "-n", "2"], 10).splitlines(); rows, hdr = {}, None
     for l in o:
         if l.startswith("S ") and "NAME" in l: hdr = (l.index("FORMAT"), l.index("NAME")); continue
@@ -59,7 +72,7 @@ def pw_errs():
         h = l[:hdr[0]].split()
         if len(h) >= 9 and h[1].isdigit():
             nm = l[hdr[1]:].strip().lstrip("+").strip()
-            if "RME_ADI" in nm or nm == "Bitwig Studio": rows[f"{nm}#{h[1]}"] = int(h[8])
+            if ("RME_ADI" in nm and rme) or nm == "Bitwig Studio": rows[f"{nm}#{h[1]}"] = int(h[8])
     return rows
 
 def activity(g):
