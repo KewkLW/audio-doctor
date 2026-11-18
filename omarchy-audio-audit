@@ -64,17 +64,16 @@ USAGE = """usage: omarchy-audio-audit [options]   (no options: full run, ~12 min
 
 
 def check_args(argv):
-    """(None, None) when argv is fine, ("help", tok) for -h/--help, ("bad", tok) for the first token that is not a known
-    flag or a flag's value.
-    A token right after a value flag is its value (also when it looks like a flag): that is how opt() reads it."""
-    bad = None
-    for i, a in enumerate(argv):
-        if i > 0 and argv[i - 1] in VALUE_FLAGS or a in FLAGS or a in VALUE_FLAGS:
-            continue
+    """(None, None) when argv is fine, ("help", tok) for -h/--help anywhere (also where a value would go: help never
+    starts a run), else ("bad", tok) for the first token that is not a known flag or a flag's value. Any other token
+    right after a value flag is its value (also when it looks like a flag): that is how opt() reads it."""
+    for a in argv:
         if a in ("-h", "--help"):
             return "help", a
-        bad = a if bad is None else bad
-    return ("bad", bad) if bad is not None else (None, None)
+    for i, a in enumerate(argv):
+        if not (a in FLAGS or a in VALUE_FLAGS or i > 0 and argv[i - 1] in VALUE_FLAGS):
+            return "bad", a
+    return None, None
 
 RME_ON = False  # set in main() from modules/rme-adi2/detect
 STATE = os.path.expanduser("~/.local/state/omarchy-studio/audit")
