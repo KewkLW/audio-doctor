@@ -191,8 +191,13 @@ fi
 # Write the manifest (deduplicated, directories kept from earlier runs).
 mkd "$KIT_DATA" || { echo "install.sh: cannot create $KIT_DATA" >&2; exit 1; }
 # Entries from an earlier run that this run did not rewrite stay, so uninstall still finds them.
-{ cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$2]=1; next } !($2 in seen)' "$NEW" "$MANIFEST"; } \
-  | sort -u >"$MANIFEST.tmp" && mv -f "$MANIFEST.tmp" "$MANIFEST"
+if ! { { cat "$NEW"; [ -f "$MANIFEST" ] && awk -F'\t' 'NR==FNR { seen[$2]=1; next } !($2 in seen)' "$NEW" "$MANIFEST"; } \
+       | sort -u >"$MANIFEST.tmp" && mv -f "$MANIFEST.tmp" "$MANIFEST"; }; then
+  rm -f "$MANIFEST.tmp"
+  echo "install.sh: FAILED to write the manifest $MANIFEST; uninstall.sh cannot find what was placed:" >&2
+  for p in "${PLACED[@]}"; do echo "  $p" >&2; done
+  exit 1
+fi
 
 echo "Placed:"
 for p in "${PLACED[@]}"; do echo "  $p"; done
@@ -248,6 +253,10 @@ elif sd_reads_unit_dir; then
 else
   echo "  installed to $UNIT_DIR, which your user systemd does not read (custom HOME or XDG_CONFIG_HOME):"
   echo "  systemctl not called, not started"
+  if [ $START = yes ]; then
+    echo "  FAILED: --start asked for, but this systemd cannot see the unit"
+    FAILED+=("--start: $UNIT_DIR is not on the user systemd unit path, service not started")
+  fi
 fi
 echo
 

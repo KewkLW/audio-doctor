@@ -59,9 +59,14 @@ for c in $(seq 1 "$CYCLES"); do
   echo "$out" | grep -q '^Done\.' && ok "install says Done" || bad "install did not say Done"
   echo "$out" | grep -q 'systemctl not called, not started' && ok "unit installed, not started, systemd untouched" || bad "unit state line missing"
 
-  echo "  placed (find, excluding seeded data):"
-  (cd "$H" && find . \( -type f -o -type l \) | sort | grep -vxF -f <(echo "$SEED")) | sed 's/^/    /'
   M=$H/.local/share/audio-doctor/install-manifest
+  POSTINST=$( (cd "$H" && find . \( -type f -o -type l \) | sort) )
+  PLACED=$(echo "$POSTINST" | grep -vxF -f <(echo "$SEED"))
+  echo "  placed (every file and link that is new after install.sh, before any command ran):"
+  echo "$PLACED" | sed 's/^/    /'
+  RECORDED=$( { awk -F'\t' '$1=="f" || $1=="l" {print $2}' "$M"; echo "$M"; } | sed "s|^$H|.|" | sort)
+  [ "$PLACED" = "$RECORDED" ] && ok "every placed file is in the manifest and every manifest file was placed" \
+    || { bad "placed files and manifest differ:"; diff <(echo "$RECORDED") <(echo "$PLACED") | sed 's/^/      /'; }
   n=0 missing=0
   while IFS=$'\t' read -r t p x; do n=$((n + 1)); [ -e "$p" ] || { missing=1; bad "manifest entry missing on disk: $p"; }; done <"$M"
   [ $missing = 0 ] && ok "all $n manifest entries exist"
@@ -91,8 +96,7 @@ for c in $(seq 1 "$CYCLES"); do
   # Files the commands themselves wrote while running (for example libpulse's ~/.config/pulse/cookie):
   # user data, not installed, so uninstall must keep them. Python bytecode next to the commands is the
   # exception: uninstall.sh removes it.
-  RUNTIME=$( (cd "$H" && find . \( -type f -o -type l \) | sort) | grep -vxF -f <(echo "$SEED") \
-             | grep -vxF -f <(cut -f2 "$M" | sed "s|^$H|.|") | grep -v '/__pycache__/' | grep -vxF './.local/share/audio-doctor/install-manifest' )
+  RUNTIME=$( (cd "$H" && find . \( -type f -o -type l \) | sort) | grep -vxF -f <(echo "$POSTINST") | grep -v '^\./\.local/bin/__pycache__/' )
   echo "  made by the commands at run time (not by install.sh): ${RUNTIME:-none}"
   EXPECT=$(printf '%s\n%s\n' "$SEED" "$RUNTIME" | grep -v '^$' | sort)
 
@@ -132,26 +136,47 @@ out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
   && ok "unwritable bin dir: exit 1, FAILED listed" || { bad "unwritable bin: exit $rc"; echo "$out" | tail -12; }
 "${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1; chmod 755 "$H/.local/bin"; rm -rf "$S"
 
-# --start whose systemctl enable fails. The shim stands in for systemctl: it claims the scratch unit
-# dir is on the unit path and fails `enable`, so the real user manager is never called.
-S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/shim"
-cat >"$S/shim/systemctl" <<EOF
-#!/bin/sh
-echo "\$*" >>"$S/shim.log"
-case "\$*" in
-  *"-p UnitPath"*) echo "$H/.config/systemd/user" ;;
-  *"-p FragmentPath"*) echo "$H/.config/systemd/user/$UNIT" ;;
-  *enable*) echo "Failed to enable unit: shim says no" >&2; exit 1 ;;
-esac
-exit 0
-EOF
-chmod +x "$S/shim/systemctl"
+# --start in a scratch HOME: the real user manager cannot see the unit (only the read-only
+# `systemctl --user show -p UnitPath` is called), so it must fail rather than claim it started.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+out=$("${E[@]}" "$REPO/install.sh" --start 2>&1); rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q 'FAILED: --start asked for' && ! echo "$out" | grep -q '^Done' \
+  && ok "--start where systemd cannot see the unit: exit 1, reported" || { bad "--start unseen unit: exit $rc"; echo "$out" | tail -8; }
+"${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1
+[ -z "$(find "$H" -mindepth 1)" ] && ok "uninstall after it leaves nothing" || bad "left after --start test: $(find "$H" -mindepth 1)"
+rm -rf "$S"
+
+# The shim stands in for systemctl: it claims the scratch unit dir is on the unit path and succeeds
+# or fails `enable`, so the real user manager is never called.
+mk_shim() {  # mk_shim DIR HOME ENABLE_RC
+  {
+    echo '#!/bin/sh'
+    echo "echo \"\$*\" >>'$1/shim.log'"
+    echo 'case "$*" in'
+    echo "  *'-p UnitPath'*) echo '$2/.config/systemd/user' ;;"
+    echo "  *'-p FragmentPath'*) echo '$2/.config/systemd/user/$UNIT' ;;"
+    echo "  *enable*) [ $3 = 0 ] || { echo 'Failed to enable unit: shim says no' >&2; exit 1; } ;;"
+    echo 'esac'
+    echo 'exit 0'
+  } >"$1/systemctl"
+  chmod +x "$1/systemctl"
+}
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/shim"; mk_shim "$S/shim" "$H" 0
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/shim:$H/.local/bin:$PATH")
+out=$("${E[@]}" "$REPO/install.sh" --start 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -q 'enabled and started' && echo "$out" | grep -q '^Done' && grep -q 'enable --now' "$S/shim/shim.log" \
+  && ok "--start with a working systemctl (shim): exit 0, enable --now called, Done" || { bad "--start happy path: exit $rc"; echo "$out" | tail -8; }
+"${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1; rm -rf "$S"
+
+# --start whose systemctl enable fails (shim).
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/shim"; mk_shim "$S/shim" "$H" 1
 E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/shim:$H/.local/bin:$PATH")
 out=$("${E[@]}" "$REPO/install.sh" --start 2>&1); rc=$?
 [ $rc = 1 ] && echo "$out" | grep -q 'FAILED to enable and start' && ! echo "$out" | grep -q '^Done' \
   && ok "--start with failing systemctl enable: exit 1, reported" || { bad "--start failure: exit $rc"; echo "$out" | tail -8; }
 out=$("${E[@]}" "$REPO/uninstall.sh" 2>&1); rc=$?
-[ $rc = 0 ] && grep -q 'disable --now' "$S/shim.log" && ok "uninstall disabled the unit through the shim" || bad "uninstall with shim: exit $rc"
+[ $rc = 0 ] && grep -q 'disable --now' "$S/shim/shim.log" && ok "uninstall disabled the unit through the shim" || bad "uninstall with shim: exit $rc"
 rm -rf "$S"
 
 # Module hooks, with a copy of the checkout holding two fake modules: one whose device is
