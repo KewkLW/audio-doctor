@@ -167,6 +167,34 @@ out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
   && ok "unwritable bin dir: exit 1, FAILED listed" || { bad "unwritable bin: exit $rc"; echo "$out" | tail -12; }
 "${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1; chmod 755 "$H/.local/bin"; rm -rf "$S"
 
+# A file install.sh placed and the user then edited is not overwritten by a second install.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$H/.local/bin:$PATH")
+"${E[@]}" "$REPO/install.sh" --no-start >/dev/null 2>&1
+echo "my notes" >>"$H/.claude/skills/audio-doctor/SKILL.md"; SUM=$(sha256sum <"$H/.claude/skills/audio-doctor/SKILL.md")
+out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q 'SKILL.md (placed by an earlier install but changed since' && [ "$(sha256sum <"$H/.claude/skills/audio-doctor/SKILL.md")" = "$SUM" ] \
+  && ok "reinstall over an edited SKILL.md: left alone, reported, exit 1" || { bad "edited SKILL.md reinstall: exit $rc"; echo "$out" | tail -8; }
+out=$("${E[@]}" "$REPO/uninstall.sh" 2>&1); rc=$?
+[ $rc = 0 ] && [ "$(sha256sum <"$H/.claude/skills/audio-doctor/SKILL.md")" = "$SUM" ] && [ "$(cd "$H" && find . -type f)" = "./.claude/skills/audio-doctor/SKILL.md" ] \
+  && ok "uninstall keeps the edited SKILL.md and removes the rest" || { bad "edited SKILL.md uninstall: exit $rc"; find "$H" -type f; }
+rm -rf "$S"
+
+# A required tool missing: the kit is installed, the pacman package is printed, exit 1. PATH is a
+# directory linking every /usr/bin entry except pw-cli.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/path"
+for f in /usr/bin/*; do [ "$(basename "$f")" = pw-cli ] || ln -s "$f" "$S/path/" 2>/dev/null; done
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/path")
+out=$("${E[@]}" "$REPO/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q 'MISSING   pw-cli  (required; pacman package: pipewire)' && echo "$out" | grep -q 'sudo pacman -S --needed pipewire' \
+  && ! echo "$out" | grep -q '^Done' && [ -x "$H/.local/bin/whatis" ] \
+  && ok "required pw-cli missing: package printed, kit still installed, exit 1" || { bad "missing dep: exit $rc"; echo "$out" | tail -8; }
+out=$("${E[@]}" "$REPO/install.sh" --check 2>&1); rc=$?
+[ $rc = 1 ] && ok "install.sh --check with pw-cli missing: exit 1" || bad "--check missing dep: exit $rc"
+"${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1
+[ -z "$(find "$H" -mindepth 1)" ] && ok "uninstall after it leaves nothing" || bad "left after missing-dep test: $(find "$H" -mindepth 1)"
+rm -rf "$S"
+
 # --start in a scratch HOME: the real user manager cannot see the unit (only the read-only
 # `systemctl --user show -p UnitPath` is called), so it must fail rather than claim it started.
 S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H"
@@ -199,6 +227,28 @@ out=$("${E[@]}" "$REPO/install.sh" --start 2>&1); rc=$?
 [ $rc = 0 ] && echo "$out" | grep -q 'enabled and started' && echo "$out" | grep -q '^Done' && grep -q 'enable --now' "$S/shim/shim.log" \
   && ok "--start with a working systemctl (shim): exit 0, enable --now called, Done" || { bad "--start happy path: exit $rc"; echo "$out" | tail -8; }
 "${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1; rm -rf "$S"
+
+# --start when the watch command in the bin dir is a foreign file: the unit is placed but never
+# enabled, since it would run a file this installer does not own (shim log shows no enable).
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H/.local/bin" "$S/shim"; mk_shim "$S/shim" "$H" 0
+printf '#!/bin/sh\ntouch "%s/foreign-watch-ran"\n' "$S" >"$H/.local/bin/omarchy-audio-watch"; chmod +x "$H/.local/bin/omarchy-audio-watch"
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/shim:$H/.local/bin:$PATH")
+out=$("${E[@]}" "$REPO/install.sh" --start 2>&1); rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q 'FAILED: not started' && ! grep -q 'enable' "$S/shim/shim.log" && [ ! -e "$S/foreign-watch-ran" ] \
+  && ok "--start with a foreign omarchy-audio-watch: not enabled (no enable call), not run, exit 1" || { bad "--start foreign watch: exit $rc"; echo "$out" | tail -8; cat "$S/shim/shim.log"; }
+"${E[@]}" "$REPO/uninstall.sh" >/dev/null 2>&1; rm -rf "$S"
+
+# Uninstall when the installed unit file was changed after install: systemctl disable is not called,
+# the unit file and the manifest stay, exit 1.
+S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/shim"; mk_shim "$S/shim" "$H" 0
+E=(env HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$H/.local/share" PATH="$S/shim:$H/.local/bin:$PATH")
+"${E[@]}" "$REPO/install.sh" --start >/dev/null 2>&1
+echo "# my change" >>"$H/.config/systemd/user/$UNIT"; : >"$S/shim/shim.log"
+out=$("${E[@]}" "$REPO/uninstall.sh" 2>&1); rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q 'Watch service: NOT stopped' && ! grep -q 'disable' "$S/shim/shim.log" \
+  && grep -q 'my change' "$H/.config/systemd/user/$UNIT" && [ -f "$H/.local/share/audio-doctor/install-manifest" ] \
+  && ok "changed unit at uninstall: not stopped (no disable call), unit and manifest kept, exit 1" || { bad "changed unit uninstall: exit $rc"; echo "$out" | tail -8; cat "$S/shim/shim.log"; }
+rm -rf "$S"
 
 # --start whose systemctl enable fails (shim).
 S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; mkdir -p "$H" "$S/shim"; mk_shim "$S/shim" "$H" 1
@@ -300,7 +350,8 @@ rm -rf "$S"
 
 # (b) A module dir the user added after install: uninstall lists it and never runs its disable.
 # (c) A hook install.sh placed, changed after install: uninstall does not run it, keeps the module and
-#     the manifest, exits 1; install.sh again restores it and the next uninstall finishes.
+#     the manifest, exits 1; install.sh refuses to overwrite the changed hook without --force;
+#     install.sh --force restores it and the next uninstall finishes.
 S=$(mktemp -d /tmp/ad-roundtrip.XXXXXX); H=$S/home; SRC=$S/src; MK=$S/marks; mkdir -p "$H" "$MK"; mk_src "$SRC"
 mk_mod "$SRC/modules/real" ours "$MK"
 MD=$H/.local/share/audio-doctor/modules
@@ -320,11 +371,16 @@ M=$H/.local/share/audio-doctor/install-manifest
   && ok "user-added module and tampered hook: neither executed (marker dir empty), module and manifest kept, exit 1, the rest removed" \
   || { bad "user-added/tampered at uninstall: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; }
 out=$("${E[@]}" "$SRC/install.sh" --no-start 2>&1); rc=$?
+[ $rc = 1 ] && echo "$out" | grep -q 'real/disable (placed by an earlier install but changed since' && grep -q tampered "$MD/real/disable" \
+  && [ -z "$(ls -A "$MK")" ] && ok "reinstall over the changed hook without --force: left alone, exit 1, module hooks not run" \
+  || { bad "reinstall over changed hook: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; }
+out=$("${E[@]}" "$SRC/install.sh" --no-start --force 2>&1); rc=$?
+[ $rc = 0 ] && ! grep -q tampered "$MD/real/disable" && ok "install.sh --force restored the hook: exit 0" || { bad "--force restore: exit $rc"; echo "$out" | tail -8; }
 rm -f "$MK"/*
 out=$("${E[@]}" "$SRC/uninstall.sh" 2>&1); rc=$?
 [ $rc = 0 ] && [ -e "$MK/ours-disable" ] && [ ! -e "$MK/user-disable" ] && [ ! -e "$MK/tampered-disable" ] \
   && [ "$(cd "$H" && find . -mindepth 1 -type f | sort | tr '\n' ' ')" = "$(cd "$H" && find ./.local/share/audio-doctor/modules/useradded -type f | sort | tr '\n' ' ')" ] \
-  && ok "after install.sh restored the hook: its own disable ran, the user module still not run and is all that is left" \
+  && ok "after install.sh --force restored the hook: its own disable ran, the user module still not run and is all that is left" \
   || { bad "retry after tamper: exit $rc, markers: $(ls "$MK")"; echo "$out" | tail -12; find "$H" -mindepth 1 -type f; }
 rm -rf "$S"
 

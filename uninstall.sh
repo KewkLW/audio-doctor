@@ -43,7 +43,8 @@ if [ -n "$unit_file" ]; then
   frag=$(systemctl --user show -p FragmentPath --value "$UNIT_NAME" 2>/dev/null) || frag=
   want=$(awk -F'\t' -v u="$unit_file" '$1=="f" && $2==u {print $3}' "$MANIFEST")
   if [ -n "$frag" ] && [ "$frag" = "$unit_file" ] && [ -f "$unit_file" ] && [ "$(sha256sum "$unit_file" | cut -d' ' -f1)" != "$want" ]; then
-    echo "Watch service: $unit_file changed since install; not yours to stop through this script, systemctl not called"
+    echo "Watch service: NOT stopped: $unit_file changed since install, so this script does not own it; systemctl not called"
+    FAILED+=("watch service: $unit_file changed since install, left running and in place; stop it yourself (systemctl --user disable --now $UNIT_NAME), or put the installed file back with install.sh --force, then run uninstall.sh again")
   elif [ -n "$frag" ] && [ "$frag" = "$unit_file" ]; then
     SD=1
     if out=$(systemctl --user disable --now "$UNIT_NAME" 2>&1); then echo "Watch service: stopped and disabled"
@@ -74,7 +75,7 @@ while IFS=$'\t' read -r t p x; do
   if [ -z "$want" ]; then echo "Module $name: install.sh placed no disable, nothing run"; continue; fi
   if [ ! -f "$hook" ] || [ -L "$hook" ] || [ ! -x "$hook" ] || [ "$(sha256sum "$hook" | cut -d' ' -f1)" != "$want" ]; then
     echo "Module $name: disable NOT run: $hook is missing or changed since install"
-    FAILED+=("module $name: $hook is not the file install.sh placed, so it was not run and what enable placed may still be there; run install.sh again (it restores the hook), then uninstall.sh")
+    FAILED+=("module $name: $hook is not the file install.sh placed, so it was not run and what enable placed may still be there; run install.sh --force (it restores the hook), then uninstall.sh")
     KEEP_MODS+=("$p")
     continue
   fi

@@ -101,9 +101,9 @@ if [ $CHECK_ONLY = 1 ]; then check_deps; exit $?; fi
 # d = directory this installer created, m = a module directory whose files this installer placed
 # (uninstall runs disable only for these, and only when the hook still has its recorded hash), b = the bin dir the commands went to (handed to module hooks
 # at uninstall; only the latest run's b line is kept).
-declare -A OLD=()
+declare -A OLD=() OLDX=()
 if [ -f "$MANIFEST" ]; then
-  while IFS=$'\t' read -r t p x; do [ -n "${p:-}" ] && OLD[$p]=$t; done <"$MANIFEST"
+  while IFS=$'\t' read -r t p x; do [ -n "${p:-}" ] && { OLD[$p]=$t; OLDX[$p]=${x:-}; }; done <"$MANIFEST"
 fi
 NEW=$(mktemp) || exit 1
 trap 'rm -f "$NEW"' EXIT
@@ -119,12 +119,23 @@ mkd() {   # create a directory and every missing parent, recording each one crea
   rec d "$d"
 }
 
-may_write() {   # 0 when DST is free, ours from an earlier run, or --force
+still_ours() {   # 0 when DST is in the old manifest and still exactly what install.sh put there
+  local dst=$1
+  [ -n "${OLD[$dst]+x}" ] || return 1
+  case ${OLD[$dst]} in
+    f) [ -f "$dst" ] && [ ! -L "$dst" ] && [ "$(sha256sum "$dst" | cut -d' ' -f1)" = "${OLDX[$dst]}" ] ;;
+    l) [ -L "$dst" ] && [ "$(readlink "$dst")" = "${OLDX[$dst]}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+may_write() {   # 0 when DST is free, unchanged from an earlier run of this installer, or --force
   local dst=$1
   [ -e "$dst" ] || [ -L "$dst" ] || return 0
-  [ -n "${OLD[$dst]+x}" ] && return 0
+  still_ours "$dst" && return 0
   [ $FORCE = 1 ] && return 0
-  SKIPPED+=("$dst (exists, not placed by this installer; --force replaces it)")
+  if [ -n "${OLD[$dst]+x}" ]; then SKIPPED+=("$dst (placed by an earlier install but changed since; --force replaces it)")
+  else SKIPPED+=("$dst (exists, not placed by this installer; --force replaces it)"); fi
   return 1
 }
 
@@ -171,7 +182,7 @@ put_pyc() {   # put_pyc DST
   local dst=$1 pyc
   head -1 "$dst" | grep -q python3 || return 0
   pyc=$(python3 -I -c 'import importlib.util,sys; print(importlib.util.cache_from_source(sys.argv[1]))' "$dst" 2>/dev/null) || return 0
-  if [ -e "$pyc" ] || [ -L "$pyc" ]; then [ -n "${OLD[$pyc]+x}" ] || return 0; fi
+  if [ -e "$pyc" ] || [ -L "$pyc" ]; then still_ours "$pyc" || return 0; fi
   mkd "$(dirname "$pyc")" || { FAILED+=("$pyc (cannot create its directory)"); return 1; }
   python3 -I -c 'import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)' "$dst" "$pyc" \
     || { rm -f "$pyc"; FAILED+=("$pyc (bytecode compile failed)"); return 1; }
@@ -179,11 +190,12 @@ put_pyc() {   # put_pyc DST
   PLACED+=("$pyc")
 }
 
+declare -A CMD_OK=()   # commands this run placed (the unit is started only when its command is one of them)
 for e in "${KIT[@]}"; do
   s=${e%%:*} n=${e#*:}
   if [ ! -f "$SRC/$s" ]; then FAILED+=("$BIN/$n (source $s not found in the checkout)"); continue; fi
-  if [ $LINK = 1 ]; then put_link "$SRC/$s" "$BIN/$n"   # linked: Python caches inside the checkout, not here
-  else put_file "$SRC/$s" "$BIN/$n" 0755 && put_pyc "$BIN/$n"; fi
+  if [ $LINK = 1 ]; then put_link "$SRC/$s" "$BIN/$n" && CMD_OK[$n]=1   # linked: Python caches inside the checkout
+  else put_file "$SRC/$s" "$BIN/$n" 0755 && CMD_OK[$n]=1 && put_pyc "$BIN/$n"; fi
 done
 
 # Watch unit: ExecStart points at the bin directory used above.
@@ -250,10 +262,6 @@ if [ ${#SKIPPED[@]} -gt 0 ]; then
   echo "Not placed (left alone):"
   for p in "${SKIPPED[@]}"; do echo "  $p"; done
 fi
-if [ ${#FAILED[@]} -gt 0 ]; then
-  echo "FAILED:"
-  for p in "${FAILED[@]}"; do echo "  $p"; done
-fi
 echo "Manifest: $MANIFEST"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "Note: $BIN is not on your PATH; add it to run the commands by name." ;; esac
 echo
@@ -302,7 +310,10 @@ elif sd_reads_unit_dir; then
       case $a in [yY]*) START=yes ;; esac
     fi
   fi
-  if [ $START = yes ]; then
+  if [ $START = yes ] && [ -z "${CMD_OK[omarchy-audio-watch]+x}" ]; then
+    echo "  FAILED: not started: $BIN/omarchy-audio-watch was not placed by this run (see above), so the unit would run a file this installer does not own"
+    FAILED+=("--start: $BIN/omarchy-audio-watch not placed by this run, service not started")
+  elif [ $START = yes ]; then
     if systemctl --user enable --now "$UNIT_NAME"; then echo "  enabled and started"
     else echo "  FAILED to enable and start it (see the systemctl message above)"; FAILED+=("systemctl --user enable --now $UNIT_NAME failed"); fi
   else
@@ -320,9 +331,12 @@ echo
 
 echo "Your data (results, logs) goes to $STATE; uninstall.sh never deletes it."
 [ $DEPS_OK = 0 ] || FAILED+=("required tools missing (see Dependencies above); the kit is installed but will not work until they are")
+if [ ${#FAILED[@]} -gt 0 ]; then
+  echo "FAILED:"
+  for p in "${FAILED[@]}"; do echo "  $p"; done
+fi
 if [ ${#FAILED[@]} -gt 0 ] || [ ${#SKIPPED[@]} -gt 0 ]; then
-  if [ $DEPS_OK != 0 ]; then echo "Some required tools are missing: see Dependencies above."; fi
-  echo "Install INCOMPLETE: ${#FAILED[@]} failed, ${#SKIPPED[@]} left alone (listed above). Exit 1."
+  echo "Install INCOMPLETE: ${#FAILED[@]} failed (FAILED above), ${#SKIPPED[@]} left alone (Not placed above). Exit 1."
   echo "What was placed is in the manifest; $SRC/uninstall.sh removes it."
   exit 1
 fi
