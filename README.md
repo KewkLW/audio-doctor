@@ -13,7 +13,7 @@ A small diagnostics kit for PipeWire audio on Arch based systems (built on Omarc
 | `omarchy-audio-watch` | Background monitor: every 30 s it logs GPU, CPU, NVMe and xrun counts. `omarchy-audio-watch report out.html` turns the log into a page with charts. Runs as a user service once you start it. |
 | `footprint` | `footprint NAME` snapshots CPU, memory, threads and the PipeWire graph; `footprint compare A B` shows the difference (for example before and after loading a DAW project). |
 
-Usage: `whatis --help`; `omarchy-audio-watch` and `footprint` with no arguments. `audio-doctor` and `config-audit` run straight away with any arguments, so `--help` is not a help page; their options are at the top of each script. Run without options they only read and measure; `--fix` (both) relinks streams and `--tone` (`audio-doctor`) plays a tone, see below. Do not pass `--help` to `omarchy-audio-audit` or `footprint`: the audit starts a full run with any arguments, and `footprint --help` takes a 30 s snapshot named `--help`. Read the top of those scripts for their options.
+Usage: `whatis --help` and `omarchy-audio-audit --help` (`-h` too); `omarchy-audio-watch` and `footprint` with no arguments. `omarchy-audio-audit --help` prints one line per option and exits 0 without starting a run, in any position; an unknown argument prints the same usage to stderr and exits 2, also without a run. `audio-doctor` and `config-audit` run straight away with any arguments, so `--help` is not a help page; their options are at the top of each script. Run without options they only read and measure; `--fix` (both) relinks streams and `--tone` (`audio-doctor`) plays a tone, see below. Do not pass `--help` to `footprint`: `footprint --help` takes a 30 s snapshot named `--help`. Read the top of that script for its options.
 
 ## Install
 
@@ -69,7 +69,7 @@ It stops and disables the watch service, runs `disable` for each module it insta
 tests/install-roundtrip.sh [cycles]
 ```
 
-Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is only checked to parse, since every run opens a playback stream), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with fake modules (including one whose `disable` fails), and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
+Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is checked to parse and then run only as `-h`, `--help` and with an unknown flag, which must print the usage, exit 0 or 2, start none of pw-cat, pw-play, pw-metadata, sudo or stress-ng and create no audit state dir, since a real run opens a playback stream), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with fake modules (including one whose `disable` fails), and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
 
 ## What the kit changes on your system
 
