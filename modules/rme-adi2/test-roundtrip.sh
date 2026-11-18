@@ -41,9 +41,13 @@ if [ -n "$EVID" ]; then  # the full run output is saved too: DIR/run-<time>.log
   exec > >(tee "$EVID/run-$(date +%Y%m%d-%H%M%S)$([ $REQUIRE_PRESENT = 1 ] && echo -require-present).log") 2>&1
 fi
 LIVE_CONF=${XDG_CONFIG_HOME:-$HOME/.config}
-T=$(mktemp -d "${TMPDIR:-/tmp}/rme-adi2-test.XXXXXX")
+TMPROOT=${TMPDIR:-/tmp}
+# no scratch dir = no test: every rm -rf below is under $T, so an empty or odd $T must stop the run here
+T=$(mktemp -d "$TMPROOT/rme-adi2-test.XXXXXX") || { echo "FAIL  cannot create a scratch dir under $TMPROOT"; exit 1; }
+case "$T" in "$TMPROOT"/rme-adi2-test.??????) ;; *) echo "FAIL  mktemp gave an unexpected path: '$T'"; exit 1 ;; esac
+[ -d "$T" ] && [ -O "$T" ] || { echo "FAIL  scratch dir $T is missing or not ours"; exit 1; }
 WPID=
-cleanup() { [ -n "$WPID" ] && kill "$WPID" 2>/dev/null; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"; }
+cleanup() { [ -n "$WPID" ] && kill "$WPID" 2>/dev/null; chmod -R u+w "${T:?}" 2>/dev/null; rm -rf "${T:?}"; }
 trap cleanup EXIT
 fails=0; passes=0
 ok()   { passes=$((passes + 1)); echo "PASS  $*"; }
@@ -74,7 +78,7 @@ LB=$XDG_CONFIG_HOME/pipewire/pipewire.conf.d/50-rme-adi2-stereo.conf
 KA=$XDG_BIN_HOME/studio-keepalive
 # config/pulse is pactl's own cookie (written when a kit tool calls pactl with the scratch XDG_CONFIG_HOME), not the module's
 tree() { (cd "$T" && find config data bin -path config/pulse -prune -o -printf '%y %p\n' | sort); }
-fresh() { rm -rf "$T/config" "$T/data" "$T/bin"; mkdir -p "$T/config" "$T/data" "$T/bin"; }
+fresh() { rm -rf "${T:?}/config" "${T:?}/data" "${T:?}/bin"; mkdir -p "$T/config" "$T/data" "$T/bin"; }
 # kit tools see the live graph and the live config dir (read only) unless a test points XDG_CONFIG_HOME at scratch
 live() { env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME "$@"; }
 
@@ -116,8 +120,8 @@ STALE_PATH=$T/stub-stale:$ABSENT_PATH
 # one real omarchy-audio-watch sample (its sampler loop, scratch HOME), stopped by the PID started here.
 # prints the sample's JSON line
 watch_sample() {
-  local h=$T/home-watch-$1 f i
-  rm -rf "$h"; mkdir -p "$h"
+  local h=${T:?}/home-watch-$1 f i
+  rm -rf "${h:?}"; mkdir -p "$h"
   env HOME="$h" PATH="$2" "$REPO/omarchy-audio-watch" run --interval 60 >"$h/out.log" 2>&1 & WPID=$!
   for i in $(seq 1 60); do
     f=$(ls "$h"/.local/state/omarchy-studio/watch/2*.jsonl 2>/dev/null | head -1)
