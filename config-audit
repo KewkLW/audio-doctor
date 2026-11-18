@@ -241,9 +241,15 @@ def audit(dump=None, fix=False, rme=None):
             find("WARN", "dupes", f"node.name '{name}' is defined in {len(set(fs))} files: " + ", ".join(short(f) for f in sorted(set(fs))),
                  "keep one definition", fs[0])
 
+    # RME module off: every stream in a file that targets the ADI-2 (both halves of its loopbacks) is the module's,
+    # so none of its checks run; one neutral line instead.
+    rme_files = {s["file"] for s in streams if is_rme(s["props"].get("target.object") or s["props"].get("node.target"))}
     for s in streams:
         p, f, name = s["props"], s["file"], s["node"]
         tgt = p.get("target.object") or p.get("node.target")
+        if not rme and (f in rme_files or is_rme(tgt)):
+            rme_skipped = True
+            continue
         if "node.target" in p and "target.object" not in p:
             find("INFO", "target", f"'{name}' uses deprecated node.target", "use target.object", f)
         if truthy(p.get("node.dont-reconnect")):
@@ -254,10 +260,8 @@ def audit(dump=None, fix=False, rme=None):
             find("WARN", "fallback", f"'{name}' has node.dont-fallback without node.linger: WirePlumber destroys it while '{tgt}' is missing",
                  "add node.linger = true", f)
 
-        # target present? if not, why. An RME target with the RME off USB is the module being off, not a fault.
-        if isinstance(tgt, str) and tgt not in by_name and is_rme(tgt) and not rme:
-            rme_skipped = True
-        elif isinstance(tgt, str) and tgt not in by_name:
+        # target present? if not, why.
+        if isinstance(tgt, str) and tgt not in by_name:
             m = re.match(r"alsa_(?:output|input)\.(.+)\.([^.]+)$", tgt)
             why = "device absent (off, unplugged or renamed)"
             if m:

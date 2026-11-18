@@ -1,6 +1,6 @@
 # Shared by detect / enable / disable / status. Sourced, not run.
 # Module contract: every executable exits 0 or 1 and prints a reason; nothing here makes an install fail.
-# File placement honours XDG_CONFIG_HOME, XDG_DATA_HOME (and XDG_BIN_HOME), so it can run against a scratch dir.
+# File placement honours XDG_CONFIG_HOME, XDG_DATA_HOME and XDG_BIN_HOME, so it can run against a scratch dir.
 #   RME_ADI2_SYSFS_USB   USB device directory to scan (default /sys/bus/usb/devices; tests point it elsewhere)
 set -u
 
@@ -8,7 +8,9 @@ MOD_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
 USB_ID=2a39:3fd2
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}
 DATA=${XDG_DATA_HOME:-$HOME/.local/share}
-BINDIR=${XDG_BIN_HOME:-$HOME/.local/bin}
+# Bin dir (contract amendments 1 and 2): ${XDG_BIN_HOME:-<parent of XDG_DATA_HOME>/bin}. The installer exports
+# XDG_BIN_HOME; with neither set this is ~/.local/bin, and a scratch XDG_DATA_HOME alone never touches the live home.
+BINDIR=${XDG_BIN_HOME:-$(dirname "$DATA")/bin}
 MANIFEST=$DATA/audio-doctor/module-state/rme-adi2.placed
 SYSFS_USB=${RME_ADI2_SYSFS_USB:-/sys/bus/usb/devices}
 RESTART_NOTE="PipeWire/WirePlumber config takes effect at the next PipeWire start (login or reboot); nothing in the kit restarts PipeWire."
@@ -46,7 +48,7 @@ render() {
   case "$kind" in
     file) cat "$src" ;;
     template) s=$(id_serial) || return 1
-              sed "/target\.object/s|RME_ADI-2_Pro__<serial>__<usb-id>|$s|" "$src" ;;
+              sed "/^#@/d; /target\.object/s|RME_ADI-2_Pro__<serial>__<usb-id>|$s|" "$src" ;;  # #@ lines: template notes only
     link) echo "$src" ;;
   esac
 }
@@ -82,6 +84,16 @@ ours() {
   dest=${rec%%$'\t'*} val=${rec#*$'\t'}
   if [ -L "$dest" ]; then [ "$(readlink "$dest")" = "$val" ]
   else [ -f "$dest" ] && [ "$(sum_of "$dest")" = "$val" ]; fi
+}
+
+# does an existing dest (not placed by this module) already hold exactly what enable would place?
+identical() {
+  local kind=$1 dest=$2 want=$3
+  if [ "$kind" = link ]; then
+    [ -L "$dest" ] && { [ "$(readlink "$dest")" = "$want" ] || [ "$(realpath "$dest" 2>/dev/null)" = "$(realpath "$want")" ]; }
+  else
+    [ -f "$dest" ] && [ ! -L "$dest" ] && [ "$(sum_of "$dest")" = "$(printf '%s\n' "$want" | sha256sum | cut -d' ' -f1)" ]
+  fi
 }
 
 adi2_line() {

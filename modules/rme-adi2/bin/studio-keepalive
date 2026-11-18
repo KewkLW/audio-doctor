@@ -5,10 +5,11 @@
 # A saved state survives a crashed run: the next `off` (or `on`, which refuses to stack) restores it.
 # RME module piece (modules/rme-adi2): `enable` links it into the bin dir. With no ADI-2 on USB (absent, off or in
 # standby) every subcommand prints one neutral line and exits 0: a missing device is not a failure here.
+# Exit codes: 0 = done or nothing to do, 1 = failed (the line says why).
 set -u
 DETECT=$(dirname "$(realpath "$0")")/../detect
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state
-mkdir -p "$(dirname "$STATE")"
+mkdir -p "$(dirname "$STATE")" || { echo "keepalive: cannot create $(dirname "$STATE")"; exit 1; }
 
 present() { [ -x "$DETECT" ] && "$DETECT" >/dev/null 2>&1; }
 command -v adi2 >/dev/null 2>&1 || { echo "keepalive: adi2 not installed: nothing to keep awake (install adi2 from adi2-control)"; exit 0; }
@@ -19,11 +20,11 @@ case "${1:-status}" in
     present || { echo "keepalive: no RME ADI-2: module off (not on USB: absent, off or in standby; wake it with its button to use keepalive)"; exit 0; }
     [ -s "$STATE" ] && { echo "keepalive: already on (saved: $(cat "$STATE"))"; exit 0; }
     cur=$(get)
-    [ -n "$cur" ] || { echo "keepalive: can't read auto_standby (is a DAW holding the ADI-2 MIDI port?)"; exit 3; }
+    [ -n "$cur" ] || { echo "keepalive: can't read auto_standby (is a DAW holding the ADI-2 MIDI port?)"; exit 1; }
     echo "$cur" > "$STATE"
     if [ "$cur" != "off" ]; then
       adi2 set device.auto_standby off >/dev/null 2>&1; sleep 0.3
-      [ "$(get)" = "off" ] || { echo "keepalive: could not switch auto_standby off"; rm -f "$STATE"; exit 4; }
+      [ "$(get)" = "off" ] || { echo "keepalive: could not switch auto_standby off"; rm -f "$STATE"; exit 1; }
     fi
     echo "keepalive on: ADI-2 auto_standby off (was $cur, restored by: studio-keepalive off)"
     ;;
@@ -33,7 +34,7 @@ case "${1:-status}" in
     present || { echo "keepalive: no RME ADI-2: module off; will restore auto_standby '$saved' when it is back on USB"; exit 0; }
     adi2 set device.auto_standby "$saved" >/dev/null 2>&1; sleep 0.3
     if [ "$(get)" = "$saved" ]; then rm -f "$STATE"; echo "keepalive off: auto_standby restored to $saved"
-    else echo "keepalive: restore to '$saved' not confirmed (DAW holding MIDI?); state kept"; exit 3; fi
+    else echo "keepalive: restore to '$saved' not confirmed (DAW holding MIDI?); state kept"; exit 1; fi
     ;;
   *)
     if ! present; then
