@@ -1,7 +1,6 @@
 # Shared by detect / enable / disable / status. Sourced, not run.
 # Module contract: every executable exits 0 or 1 and prints a reason; nothing here makes an install fail.
 # File placement honours XDG_CONFIG_HOME, XDG_DATA_HOME and XDG_BIN_HOME, so it can run against a scratch dir.
-#   RME_ADI2_SYSFS_USB   USB device directory to scan (default /sys/bus/usb/devices; tests point it elsewhere)
 set -u
 
 MOD_DIR=$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)
@@ -12,7 +11,6 @@ DATA=${XDG_DATA_HOME:-$HOME/.local/share}
 # XDG_BIN_HOME; with neither set this is ~/.local/bin, and a scratch XDG_DATA_HOME alone never touches the live home.
 BINDIR=${XDG_BIN_HOME:-$(dirname "$DATA")/bin}
 MANIFEST=$DATA/audio-doctor/module-state/rme-adi2.placed
-SYSFS_USB=${RME_ADI2_SYSFS_USB:-/sys/bus/usb/devices}
 RESTART_NOTE="PipeWire/WirePlumber config takes effect at the next PipeWire start (login or reboot); nothing in the kit restarts PipeWire."
 
 # piece name | kind (file, template, link) | source in the module | destination
@@ -23,10 +21,15 @@ pieces() {
     studio-keepalive link     "$MOD_DIR/bin/studio-keepalive"             "$BINDIR/studio-keepalive"
 }
 
-# sysfs directory of the ADI-2 Pro on the bus, empty when absent
+# is the ADI-2 Pro on the bus? lsusb (usbutils) when installed, else the sysfs USB device list
+on_usb() {
+  if command -v lsusb >/dev/null 2>&1; then lsusb -d "$USB_ID" >/dev/null 2>&1; else usb_dev >/dev/null; fi
+}
+
+# sysfs directory of the ADI-2 Pro on the bus (used to read its udev ID_SERIAL), empty when absent
 usb_dev() {
   local d
-  for d in "$SYSFS_USB"/*; do
+  for d in /sys/bus/usb/devices/*; do
     [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ] || continue
     [ "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" = "$USB_ID" ] && { echo "$d"; return 0; }
   done
@@ -75,8 +78,8 @@ man_del() {
 mkd() {
   local d=$1 x missing=()
   while [ ! -d "$d" ]; do missing+=("$d"); d=$(dirname "$d"); done
-  mkdir -p "$1" || return 1
-  for x in "${missing[@]}"; do man_put "dir:$x" dir "$x" - || return 1; done
+  for x in "${missing[@]}"; do man_put "dir:$x" dir "$x" - || return 1; done  # recorded before it exists
+  mkdir -p "$1"
 }
 
 # is the thing at dest exactly what enable placed (manifest record still matches)?

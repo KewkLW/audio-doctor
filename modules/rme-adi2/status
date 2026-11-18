@@ -2,7 +2,7 @@
 # status [--json]: one line per piece (placed / present-identical-not-managed / present-not-ours / missing), plus device and adi2.
 . "$(dirname "$(realpath "$0")")/lib.sh" || { echo "rme-adi2 status: cannot read lib.sh"; exit 1; }
 json=0; [ "${1:-}" = --json ] && json=1
-if usb_dev >/dev/null; then dev=present; else dev="absent (off USB or in standby)"; fi
+if on_usb; then dev=present; else dev="absent (off USB or in standby)"; fi
 if command -v adi2 >/dev/null 2>&1; then adi2s=installed; else adi2s="adi2 not installed"; fi
 rows=()
 while IFS='|' read -r name kind src dest; do

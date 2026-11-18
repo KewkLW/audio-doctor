@@ -179,6 +179,11 @@ def silent(v):
     return v is None or v == float("-inf") or v < SILENT_DB
 
 # ------------------------------------------------------------------ RME ADI-2
+def rme_sinks(sinks, by_name):
+    """Sinks that belong to the ADI-2: its own ALSA sinks and loopback sinks whose X.out leg targets it."""
+    return {n for n in sinks if confaudit.is_rme(n) or
+            confaudit.is_rme((by_name.get(n + ".out") or {}).get("props", {}).get("target.object"))}
+
 def rme_check(hw, present):
     """Only when modules/rme-adi2/detect says the ADI-2 is on USB (standby = absent)."""
     if not present or not any("ADI-2" in c["desc"] for c in hw["alsa_cards"]) or not shutil.which("adi2"):
@@ -245,7 +250,10 @@ def main():
     for c in cards:
         if c.get("active_profile") == "off":
             find("WARN", "hardware", f"card '{c['properties'].get('device.description', c['name'])}' profile is OFF", f"pactl set-card-profile {c['name']} <profile>")
-    if def_sink not in sinks:
+    # RME module off (detect: ADI-2 not on USB, standby included): sinks that belong to the ADI-2 (its ALSA sinks, and
+    # loopback sinks whose .out leg targets it) may linger; none of their checks, nor those of streams into them, run.
+    rme_off = set() if rme_on else rme_sinks(sinks, by_name)
+    if def_sink not in sinks and not (not rme_on and confaudit.is_rme(def_sink)):
         find("BREAK", "routing", f"default sink '{def_sink}' does not exist", "pactl set-default-sink <sink>")
 
     # streams
@@ -345,18 +353,18 @@ def main():
         sink_info[n] = {"desc": s.get("description"), "state": s.get("state"), "mute": s.get("mute"),
                         "volume_pct": vol_pct(s.get("volume", {})), "level": levels.get("sink:" + n),
                         "feeds_hardware": hops.get(n), "default": n == def_sink}
+        if n in rme_off: continue
         if s.get("mute"): find("BREAK", "sink", f"sink '{s.get('description')}' is MUTED", f"pactl set-sink-mute {n} 0")
         v = sink_info[n]["volume_pct"]
         if v is not None and v <= 2: find("BREAK", "sink", f"sink '{s.get('description')}' volume is {v}%", f"pactl set-sink-volume {n} 50%")
         if n in hops and not hops[n]:
-            out_tgt = (by_name.get(n + ".out") or {}).get("props", {}).get("target.object")
-            if not rme_on and confaudit.is_rme(out_tgt):
-                continue  # RME loopback waiting for the ADI-2 (off USB / standby): the module is off, not a break
             find("BREAK", "routing", f"virtual sink '{s.get('description')}' is not linked to any hardware sink", "device off/unplugged/renamed? if it is back: audio-doctor --fix (relinks); see the config findings")
 
     # stream verdicts
     pw_since = ctx.since
     for s in streams:
+        if rme_off and (s["sink"] in rme_off or any(x in rme_off or confaudit.is_rme(x) for x in s["linked_to"])):
+            continue  # plays into the ADI-2 while the module is off
         tag = f"{s['label']} [{s['media'][:40]}]"
         if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
         elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
@@ -389,7 +397,7 @@ def main():
         a["has_stream"] = a["pid"] in stream_owners
 
     # tone test
-    if TONE:
+    if TONE and def_sink not in rme_off:  # a tone into a lingering ADI-2 sink while the module is off proves nothing
         ok = not silent(sink_info.get(def_sink, {}).get("level"))
         hw_ok = all(not silent(sink_info.get(h, {}).get("level")) for h in (sink_info.get(def_sink, {}).get("feeds_hardware") or [def_sink]))
         if not ok: find("BREAK", "tone", f"test tone did not show up on default sink '{def_sink}'")

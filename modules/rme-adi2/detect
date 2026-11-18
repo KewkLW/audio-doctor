@@ -1,7 +1,7 @@
 #!/bin/bash
 # detect: exit 0 when the RME ADI-2 Pro (USB 2a39:3fd2) is on the bus, else 1 (prints nothing when absent).
-# Device standby drops it off USB, so standby counts as absent. Reads sysfs only: never talks to the device.
+# Device standby drops it off USB, so standby counts as absent. Reads lsusb/sysfs only: never talks to the device.
 . "$(dirname "$(realpath "$0")")/lib.sh" 2>/dev/null || exit 1
-usb_dev >/dev/null || exit 1
+on_usb || exit 1
 echo "RME ADI-2 Pro on USB ($USB_ID)"
 exit 0

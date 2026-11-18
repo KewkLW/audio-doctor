@@ -302,6 +302,9 @@ def audit(dump=None, fix=False, rme=None):
         mc = p.get("media.class") or ""
         if not tgt or not mc.startswith("Stream/") or nid in linked:
             continue
+        if not rme and is_rme(tgt):  # a lingering ADI-2 leg while the module is off
+            rme_skipped = True
+            continue
         # target.object is a node.name or an object.serial (NOT an id); node.target is a name or an id
         tid = by_name.get(tgt)
         if tid is None and str(tgt).isdigit():

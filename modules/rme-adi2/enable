@@ -9,7 +9,11 @@ rc=0
 # the manifest directory itself, recorded once it exists
 mdirs=(); d=$(dirname "$MANIFEST"); while [ ! -d "$d" ]; do mdirs+=("$d"); d=$(dirname "$d"); done
 mkdir -p "$(dirname "$MANIFEST")" || { echo "rme-adi2: cannot create $(dirname "$MANIFEST")"; exit 1; }
-for d in "${mdirs[@]}"; do man_put "dir:$d" dir "$d" - || { echo "rme-adi2: cannot write $MANIFEST"; exit 1; }; done
+for d in "${mdirs[@]}"; do
+  man_put "dir:$d" dir "$d" - && continue
+  for x in "${mdirs[@]}"; do rmdir "$x" 2>/dev/null; done  # deepest first: undo what was created, place nothing
+  echo "rme-adi2: cannot write $MANIFEST: nothing placed"; exit 1
+done
 while IFS='|' read -r name kind src dest; do
   if ours "$name"; then echo "$name: already placed by this module: $dest"; continue; fi
   if { [ -e "$dest" ] || [ -L "$dest" ]; } && [ -n "$(man_get "$name")" ]; then
@@ -26,13 +30,19 @@ while IFS='|' read -r name kind src dest; do
     fi
     continue
   fi
-  mkd "$(dirname "$dest")" || { echo "$name: NOT placed: cannot create $(dirname "$dest")"; rc=1; continue; }
+  mkd "$(dirname "$dest")" || { echo "$name: NOT placed: cannot create or record $(dirname "$dest")"; rc=1; continue; }
+  # record first, then place: a piece on disk is always in the manifest, so disable can always remove it.
+  # If placing fails the record is dropped again; if even that fails, disable later finds the dest gone.
   if [ "$kind" = link ]; then
-    ln -s "$want" "$dest" && man_put "$name" "$kind" "$dest" "$want" \
-      && echo "$name: placed $dest -> $want" || { echo "$name: NOT placed: link failed"; rm -f "$dest"; rc=1; }
+    man_put "$name" "$kind" "$dest" "$want" || { echo "$name: NOT placed: cannot write $MANIFEST"; rc=1; continue; }
+    if ln -s "$want" "$dest"; then echo "$name: placed $dest -> $want"
+    else echo "$name: NOT placed: link failed"; man_del "$name"; rc=1; fi
   else
-    printf '%s\n' "$want" >"$dest.rme-adi2.tmp" && mv -f "$dest.rme-adi2.tmp" "$dest" && man_put "$name" "$kind" "$dest" "$(sum_of "$dest")" \
-      && echo "$name: placed $dest" || { echo "$name: NOT placed: write failed"; rm -f "$dest.rme-adi2.tmp"; rc=1; }
+    tmp="$dest.rme-adi2.tmp"
+    if ! printf '%s\n' "$want" >"$tmp"; then echo "$name: NOT placed: write failed"; rm -f "$tmp"; rc=1; continue; fi
+    man_put "$name" "$kind" "$dest" "$(sum_of "$tmp")" || { echo "$name: NOT placed: cannot write $MANIFEST"; rm -f "$tmp"; rc=1; continue; }
+    if mv -f "$tmp" "$dest"; then echo "$name: placed $dest"
+    else echo "$name: NOT placed: write failed"; rm -f "$tmp"; man_del "$name"; rc=1; fi
   fi
 done < <(pieces)
 adi2_line
