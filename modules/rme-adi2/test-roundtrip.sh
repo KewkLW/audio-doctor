@@ -8,8 +8,9 @@
 # sweep_gate, rme_scrub, power_settings) with the stream path stubbed out, labelled "STUBBED" below.
 #
 #   L  live safety: sha256 of every live PipeWire/WirePlumber drop-in and the PipeWire/WirePlumber PIDs, taken before
-#      everything and compared after everything; any difference fails. --evidence DIR writes live-before.sha and
-#      live-after.sha there. All placement goes into a scratch XDG tree; the live config is only read.
+#      everything and compared after everything; any difference fails. --evidence DIR writes live-before.sha,
+#      live-after.sha and the full run output (run-<time>[-require-present].log) there. All placement goes into a
+#      scratch XDG tree; the live config is only read.
 #   A  module cases that need no device: absent detect, unresolvable unit (nothing half-filled), unwritable manifest,
 #      existing identical / different destination files.
 #   B  present lifecycle on the real unit: detect 0, enable twice into scratch dirs, status, status --json, generated
@@ -17,8 +18,11 @@
 #      SKIP by default (laptop / standby runs), FAIL with --require-present.
 #   C  absent state: a stub lsusb first on PATH reports no 2a39:3fd2 (detect itself has no test hook). The real kit
 #      tools run end to end twice each: audio-doctor (text and --json), config-audit (live config, and the scratch dir
-#      holding the RME drop-ins), whatis --audio, omarchy-audio-watch (one real sample), audit/footprint,
-#      studio-keepalive status. No RME row, BREAK, WARN or error; at most one neutral line; exit 0.
+#      holding the RME drop-ins, and one file mixing the RME loopbacks with an unrelated faulty stream, which must still
+#      be reported), whatis --audio, omarchy-audio-watch (one real sample), audit/footprint (text and saved JSON),
+#      studio-keepalive status. A stale rme_phones default whose nodes are gone is SIMULATED with pass-through
+#      pactl/pw-dump stubs that hide the ADI-2 and module nodes. No RME row, BREAK, WARN or error; at most one neutral
+#      line; exit 0. audio-doctor --tone is NOT executed (audio hold): its gates are checked in the source.
 #
 # Kit tools are run from this checkout (the repo two levels up), never the installed copies.
 set -u
@@ -83,6 +87,31 @@ printf '#!/bin/sh\nexit 0\n' >"$T/stub-unresolved/udevadm"
 printf '#!/bin/sh\necho "[]"\n' >"$T/stub-unresolved/pw-dump"
 chmod +x "$T"/stub-*/*
 ABSENT_PATH=$T/stub-absent:$PATH
+# stale default (SIMULATED): pactl and pw-dump pass through to the real tools (read only) but hide every ADI-2 node and
+# every module loopback node (rme_phones, rme_in, ...), and pactl names rme_phones as the default sink: the module is
+# off, its loopback default lingers in the settings, its nodes are gone
+mkdir -p "$T/stub-stale"
+for tool in pactl pw-dump; do
+  real=$(command -v $tool) || continue
+  cat >"$T/stub-stale/$tool" <<STUB
+#!/usr/bin/env python3
+import json, re, subprocess, sys
+RME = re.compile(r'RME_ADI|"rme_(phones|in)(\\.out|\\.cap)?"|\\brme_(phones|in)(\\.out|\\.cap)?\\b')
+args = sys.argv[1:]
+if "$tool" == "pactl" and args == ["get-default-sink"]:
+    print("rme_phones"); sys.exit(0)
+r = subprocess.run(["$real"] + args, capture_output=True, text=True)
+try:
+    data = json.loads(r.stdout)
+except ValueError:
+    sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)
+if isinstance(data, list):
+    data = [o for o in data if not (isinstance(o, dict) and o.get("type") != "PipeWire:Interface:Metadata" and RME.search(json.dumps(o)))]
+print(json.dumps(data)); sys.exit(r.returncode)
+STUB
+done
+chmod +x "$T"/stub-stale/*
+STALE_PATH=$T/stub-stale:$ABSENT_PATH
 
 # one real omarchy-audio-watch sample (its sampler loop, scratch HOME), stopped by the PID started here.
 # prints the sample's JSON line
@@ -280,10 +309,21 @@ def load(f, n):
 ca = load("config-audit", "ca")
 assert ca.RME_NODES == {"rme_phones", "rme_phones.out", "rme_in", "rme_in.cap"}, ca.RME_NODES
 assert all(ca.is_rme(n) for n in ca.RME_NODES) and not ca.is_rme("alsa_output.pci-0.hdmi") and not ca.is_rme(None)
-ad = open(os.path.join(sys.argv[1], "audio-doctor")).read()  # its default-sink BREAK and --tone gates go through is_rme
+# --tone is NOT executed (audio hold): its two gates (start, result) are checked in the source
+ad = open(os.path.join(sys.argv[1], "audio-doctor")).read()
 assert "not (not rme_on and confaudit.is_rme(def_sink))" in ad and "if TONE and def_sink and not rme_target(def_sink)" in ad
 assert "def rme_target(n): return n in rme_off or (not rme_on and confaudit.is_rme(n))" in ad
+assert "if TONE and not rme_target(def_sink):" in ad
 PYEOF
+  out=$(live env PATH="$STALE_PATH" "$REPO/audio-doctor" 2>&1); rc=$?; [ $i = 1 ] && echo "$out" | mask
+  check "C$i audio-doctor, stale rme_phones default with its nodes gone (SIMULATED: pactl/pw-dump stubs): exit 0, no BREAK/WARN, no RME row, one neutral line" \
+    bash -c '[ "$1" = 0 ] && ! grep -qE "Traceback|\[(BREAK|WARN)" <<<"$2" && ! grep -q rme_phones <<<"$2" && [ "$(grep -c "no RME ADI-2: module off" <<<"$2")" = 1 ]' _ $rc "$out"
+  check "C$i audio-doctor (stale default) has no RME row" nor <<<"$out"
+  out=$(live env PATH="$STALE_PATH" "$REPO/audio-doctor" --json 2>&1); rc=$?
+  check "C$i audio-doctor --json, stale rme_phones default: exit 0, default_sink null, no BREAK/WARN, rme_phones nowhere" jrc $rc "$out" '
+assert d["rme_module"] == "off" and d["default_sink"] is None, d["default_sink"]
+assert not [f for f in d["findings"] if f["severity"] in ("BREAK", "WARN")], d["findings"]
+assert "rme_phones" not in json.dumps(d), "rme_phones named"'
   out=$(live env PATH="$ABSENT_PATH" "$REPO/whatis" --audio 2>&1); rc=$?
   check "C$i whatis --audio: exit 0, no RME error" bash -c '[ "$1" = 0 ] && ! grep -qiE "traceback|(rme|adi).*(error|fail)" <<<"$2"' _ $rc "$out"
   out=$(watch_sample absent-$i "$ABSENT_PATH"); rc=$?; wshow "$out"
