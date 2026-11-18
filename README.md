@@ -13,7 +13,7 @@ A small diagnostics kit for PipeWire audio on Arch based systems (built on Omarc
 | `omarchy-audio-watch` | Background monitor: every 30 s it logs GPU, CPU, NVMe and xrun counts. `omarchy-audio-watch report out.html` turns the log into a page with charts. Runs as a user service once you start it. |
 | `footprint` | `footprint NAME` snapshots CPU, memory, threads and the PipeWire graph; `footprint compare A B` shows the difference (for example before and after loading a DAW project). |
 
-Usage: `whatis --help`; `omarchy-audio-watch` and `footprint` with no arguments. `audio-doctor` and `config-audit` run straight away with any arguments (both are read only); their options are at the top of each script. Do not pass `--help` to `omarchy-audio-audit` or `footprint`: the audit starts a full run with any arguments, and `footprint --help` takes a 30 s snapshot named `--help`. Read the top of those scripts for their options.
+Usage: `whatis --help`; `omarchy-audio-watch` and `footprint` with no arguments. `audio-doctor` and `config-audit` run straight away with any arguments, so `--help` is not a help page; their options are at the top of each script. Run without options they only read and measure; `--fix` (both) relinks streams and `--tone` (`audio-doctor`) plays a tone, see below. Do not pass `--help` to `omarchy-audio-audit` or `footprint`: the audit starts a full run with any arguments, and `footprint --help` takes a 30 s snapshot named `--help`. Read the top of those scripts for their options.
 
 ## Install
 
@@ -32,6 +32,8 @@ No sudo, and it never installs packages. It places:
 - a manifest of all of the above in `~/.local/share/audio-doctor/install-manifest`
 
 It honours `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. If a file it wants to place already exists and was not placed by it, it leaves that file alone and says so (`--force` replaces it).
+
+It ends with `Done.` and exit 0 only when everything was placed (and, with `--start`, the service really started). Otherwise it lists what failed or was left alone, says `Install INCOMPLETE` and exits 1; what it did place is in the manifest, so `./uninstall.sh` still removes it. `uninstall.sh` likewise exits 1 and keeps the manifest when a removal fails, so you can run it again.
 
 To start the watch service, answer yes at the prompt, pass `--start`, or later run:
 
@@ -60,6 +62,14 @@ The installer checks these and prints the package to install for anything missin
 ```
 
 It stops and disables the watch service, runs each module's `disable`, then removes exactly the files in the manifest. A file you edited after install is kept and listed. It never deletes your results in `~/.local/state/omarchy-studio/` (audit reports, watch logs, footprints) or any report you saved elsewhere; it prints where they are so you can delete them yourself.
+
+## Testing the installer
+
+```
+tests/install-roundtrip.sh [cycles]
+```
+
+Installs into a throwaway HOME under `/tmp` (default twice), lists every file placed, runs each installed command (no audio is played: `audio-doctor --audit`, and `omarchy-audio-audit` is only parsed), uninstalls and checks that only user data is left. It also checks the failure paths (exit 1, never `Done`), the module hooks with two fake modules, and that your own install (command links, watch service state, skill directory) is identical before and after. It never calls your real systemd with a write command.
 
 ## What the kit changes on your system
 

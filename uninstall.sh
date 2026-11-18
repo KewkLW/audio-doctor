@@ -36,14 +36,16 @@ fi
 
 # 1. Watch unit: stop and disable it only when systemd's loaded unit is the very file we installed
 #    (a scratch HOME must never stop the real user's service of the same name).
+FAILED=()
 unit_file=$(awk -F'\t' -v u="$UNIT_DIR/$UNIT_NAME" '$1=="f" && $2==u {print $2}' "$MANIFEST")
 SD=0
 if [ -n "$unit_file" ]; then
   frag=$(systemctl --user show -p FragmentPath --value "$UNIT_NAME" 2>/dev/null) || frag=
   if [ -n "$frag" ] && [ "$frag" = "$unit_file" ]; then
     SD=1
-    systemctl --user disable --now "$UNIT_NAME" 2>&1 | sed 's/^/  /'
-    echo "Watch service: stopped and disabled"
+    if out=$(systemctl --user disable --now "$UNIT_NAME" 2>&1); then echo "Watch service: stopped and disabled"
+    else echo "Watch service: FAILED to stop and disable it"; FAILED+=("systemctl --user disable --now $UNIT_NAME failed"); fi
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
   else
     echo "Watch service: systemd is not using $unit_file (scratch HOME or never loaded); systemctl not called"
   fi
@@ -67,18 +69,22 @@ fi
 # 3. Files and links, only when they are still what install.sh put there.
 under_state() { case $1 in "$STATE"|"$STATE"/*) return 0 ;; esac; return 1; }
 removed=0 kept=()
+rm_one() {
+  if rm -f "$1"; then removed=$((removed + 1)); echo "  removed $1"
+  else FAILED+=("$1 (rm failed)"); fi
+}
 while IFS=$'\t' read -r t p x; do
   [ -n "${p:-}" ] || continue
   if under_state "$p"; then kept+=("$p (inside your data directory, never removed)"); continue; fi
   case $t in
     f)
       if [ -f "$p" ] && [ ! -L "$p" ]; then
-        if [ "$(sha256sum "$p" | cut -d' ' -f1)" = "$x" ]; then rm -f "$p" && removed=$((removed + 1)) && echo "  removed $p"
+        if [ "$(sha256sum "$p" | cut -d' ' -f1)" = "$x" ]; then rm_one "$p"
         else kept+=("$p (changed since install)"); fi
       fi ;;
     l)
       if [ -L "$p" ]; then
-        if [ "$(readlink "$p")" = "$x" ]; then rm -f "$p" && removed=$((removed + 1)) && echo "  removed $p"
+        if [ "$(readlink "$p")" = "$x" ]; then rm_one "$p"
         else kept+=("$p (now points somewhere else)"); fi
       fi ;;
   esac
@@ -97,11 +103,12 @@ while IFS=$'\t' read -r t p x; do
   rmdir "$pc" 2>/dev/null && echo "  removed $pc/"
 done <"$MANIFEST"
 
-[ $SD = 1 ] && systemctl --user daemon-reload
+if [ $SD = 1 ]; then systemctl --user daemon-reload || FAILED+=("systemctl --user daemon-reload failed"); fi
 
 # 4. The manifest, then the directories install.sh created, deepest first, only when empty.
 dirs=$(awk -F'\t' '$1=="d" {print length($2) "\t" $2}' "$MANIFEST" | sort -rn | cut -f2-)
-rm -f "$MANIFEST"
+if [ ${#FAILED[@]} -eq 0 ]; then rm -f "$MANIFEST"
+else kept+=("$MANIFEST (kept because something failed; run uninstall.sh again after fixing it)"); fi
 while IFS= read -r d; do
   [ -n "$d" ] && [ -d "$d" ] || continue
   under_state "$d" && continue
@@ -114,4 +121,9 @@ if [ ${#kept[@]} -gt 0 ]; then
   for k in "${kept[@]}"; do echo "  $k"; done
 fi
 keep_data_note
+if [ ${#FAILED[@]} -gt 0 ]; then
+  echo "FAILED:"
+  for f in "${FAILED[@]}"; do echo "  $f"; done
+  exit 1
+fi
 exit 0

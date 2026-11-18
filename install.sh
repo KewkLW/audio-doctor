@@ -106,13 +106,13 @@ fi
 NEW=$(mktemp) || exit 1
 trap 'rm -f "$NEW"' EXIT
 rec() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >>"$NEW"; }
-PLACED=() SKIPPED=()
+PLACED=() SKIPPED=() FAILED=()
 
 mkd() {   # create a directory and every missing parent, recording each one created
   local d=$1
   [ -d "$d" ] && return 0
   mkd "$(dirname "$d")" || return 1
-  mkdir "$d" || return 1
+  mkdir "$d" || { FAILED+=("$d (mkdir failed)"); return 1; }
   rec d "$d"
 }
 
@@ -125,21 +125,22 @@ may_write() {   # 0 when DST is free, ours from an earlier run, or --force
   return 1
 }
 
+# Each returns 1 when DST was not placed; a real failure goes to FAILED, a file we must not touch to SKIPPED.
 put_file() {   # put_file SRC DST MODE
   local src=$1 dst=$2 mode=$3 tmp
-  may_write "$dst" || return 0
-  mkd "$(dirname "$dst")" || { SKIPPED+=("$dst (cannot create its directory)"); return 0; }
-  tmp=$(mktemp "$(dirname "$dst")/.audio-doctor-install.XXXXXX") || return 1
-  cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; SKIPPED+=("$dst (copy failed)"); return 0; }
+  may_write "$dst" || return 1
+  mkd "$(dirname "$dst")" || { FAILED+=("$dst (cannot create its directory)"); return 1; }
+  tmp=$(mktemp "$(dirname "$dst")/.audio-doctor-install.XXXXXX") || { FAILED+=("$dst (cannot create a temp file)"); return 1; }
+  cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; FAILED+=("$dst (copy failed)"); return 1; }
   rec f "$dst" "$(sha256sum "$dst" | cut -d' ' -f1)"
   PLACED+=("$dst")
 }
 
 put_link() {   # put_link TARGET DST
   local tgt=$1 dst=$2
-  may_write "$dst" || return 0
-  mkd "$(dirname "$dst")" || { SKIPPED+=("$dst (cannot create its directory)"); return 0; }
-  rm -f "$dst" && ln -s "$tgt" "$dst" || { SKIPPED+=("$dst (link failed)"); return 0; }
+  may_write "$dst" || return 1
+  mkd "$(dirname "$dst")" || { FAILED+=("$dst (cannot create its directory)"); return 1; }
+  rm -f "$dst" && ln -s "$tgt" "$dst" || { FAILED+=("$dst (link failed)"); return 1; }
   rec l "$dst" "$tgt"
   PLACED+=("$dst -> $tgt")
 }
@@ -160,14 +161,17 @@ echo
 
 for e in "${KIT[@]}"; do
   s=${e%%:*} n=${e#*:}
-  if [ ! -f "$SRC/$s" ]; then SKIPPED+=("$BIN/$n (source $s not found in the checkout)"); continue; fi
+  if [ ! -f "$SRC/$s" ]; then FAILED+=("$BIN/$n (source $s not found in the checkout)"); continue; fi
   if [ $LINK = 1 ]; then put_link "$SRC/$s" "$BIN/$n"; else put_file "$SRC/$s" "$BIN/$n" 0755; fi
 done
 
 # Watch unit: ExecStart points at the bin directory used above.
 UNIT_TMP=$(mktemp) || exit 1
-sed "s|@BINDIR@|$BIN|g" "$SRC/omarchy-audio-watch.service" >"$UNIT_TMP"
-put_file "$UNIT_TMP" "$UNIT_DIR/$UNIT_NAME" 0644
+if sed "s|@BINDIR@|$BIN|g" "$SRC/omarchy-audio-watch.service" >"$UNIT_TMP"; then
+  put_file "$UNIT_TMP" "$UNIT_DIR/$UNIT_NAME" 0644
+else
+  FAILED+=("$UNIT_DIR/$UNIT_NAME (cannot read the unit template)")
+fi
 rm -f "$UNIT_TMP"
 
 put_file "$SRC/SKILL.md" "$SKILL_DIR/SKILL.md" 0644
@@ -193,8 +197,12 @@ mkd "$KIT_DATA" || { echo "install.sh: cannot create $KIT_DATA" >&2; exit 1; }
 echo "Placed:"
 for p in "${PLACED[@]}"; do echo "  $p"; done
 if [ ${#SKIPPED[@]} -gt 0 ]; then
-  echo "Not placed:"
+  echo "Not placed (left alone):"
   for p in "${SKIPPED[@]}"; do echo "  $p"; done
+fi
+if [ ${#FAILED[@]} -gt 0 ]; then
+  echo "FAILED:"
+  for p in "${FAILED[@]}"; do echo "  $p"; done
 fi
 echo "Manifest: $MANIFEST"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "Note: $BIN is not on your PATH; add it to run the commands by name." ;; esac
@@ -223,7 +231,7 @@ echo "Watch service ($UNIT_NAME):"
 if ! grep -qF $'f\t'"$UNIT_DIR/$UNIT_NAME"$'\t' "$MANIFEST"; then
   echo "  not placed (see above); systemd left alone"
 elif sd_reads_unit_dir; then
-  systemctl --user daemon-reload
+  systemctl --user daemon-reload || FAILED+=("systemctl --user daemon-reload failed")
   if [ $START = ask ]; then
     START=no
     if [ -t 0 ] && [ -t 1 ]; then
@@ -232,7 +240,8 @@ elif sd_reads_unit_dir; then
     fi
   fi
   if [ $START = yes ]; then
-    systemctl --user enable --now "$UNIT_NAME" && echo "  enabled and started"
+    if systemctl --user enable --now "$UNIT_NAME"; then echo "  enabled and started"
+    else echo "  FAILED to enable and start it (see the systemctl message above)"; FAILED+=("systemctl --user enable --now $UNIT_NAME failed"); fi
   else
     echo "  installed, not started. Start it with: systemctl --user enable --now $UNIT_NAME"
   fi
@@ -244,5 +253,10 @@ echo
 
 echo "Your data (results, logs) goes to $STATE; uninstall.sh never deletes it."
 [ $DEPS_OK = 0 ] || echo "Some required tools are missing: see Dependencies above."
+if [ ${#FAILED[@]} -gt 0 ] || [ ${#SKIPPED[@]} -gt 0 ]; then
+  echo "Install INCOMPLETE: ${#FAILED[@]} failed, ${#SKIPPED[@]} left alone (listed above). Exit 1."
+  echo "What was placed is in the manifest; $SRC/uninstall.sh removes it."
+  exit 1
+fi
 echo "Done. Uninstall with: $SRC/uninstall.sh"
 exit 0
