@@ -47,7 +47,7 @@ omarchy-audio-audit --disk-path /path/to/samples     # disk wake test on the sam
 ## Keep the interface awake: studio-keepalive (ALWAYS for unattended runs)
 The RME ADI-2 has **auto-standby**: after a quiet stretch it powers down and **drops off USB** (kernel: `usb 1-2: USB disconnect`, no reconnect). Audio is then gone until someone presses its button or uses its remote; the host can't wake it (a USB port power-cycle doesn't either).
 ```
-studio-keepalive on        # saves device.auto_standby and sets it off (refuses if the RME is asleep/off USB)
+studio-keepalive on        # starts a read-only MIDI status pulse every 60 s, never changes a device setting (no RME on USB: "module off", exit 0)
 studio-keepalive off       # restores the saved value (also after a crashed run)
 studio-keepalive status
 ```

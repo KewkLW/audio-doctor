@@ -1,48 +1,73 @@
 #!/bin/bash
-# studio-keepalive on|off|status : keep the audio interface awake during automated tests.
-# RME ADI-2: switches device.auto_standby off for the run and restores the saved value afterwards.
-# Needs the ADI-2's MIDI port: run `on` BEFORE a DAW starts (Bitwig holds the port) and `off` after it quits.
-# A saved state survives a crashed run: the next `off` (or `on`, which refuses to stack) restores it.
+# studio-keepalive on|off|status : keep the RME ADI-2 awake during automated tests with a fail-safe pulse.
+# `on` starts a background pulse: one read-only MIDI status query (`adi2 status`) every 60 s. It NEVER writes
+# device.auto_standby or any other device setting, so there is nothing to restore: when the pulse stops for any
+# reason (off, crash, kill -9, reboot) the device's own standby timer simply takes over again.
+# Known limit: while a program (a DAW) holds the ADI-2 MIDI port raw, the query cannot reach the device; the pulse
+# then records that line and `status` reports it and exits 1 instead of pretending to keep the device awake.
 # RME module piece (modules/rme-adi2): `enable` links it into the bin dir. With no ADI-2 on USB (absent, off or in
-# standby) every subcommand prints one neutral line and exits 0: a missing device is not a failure here.
-# Exit codes: 0 = done or nothing to do, 1 = failed (the line says why).
+# standby) `on` and `status` print one neutral line and exit 0: a missing device is not a failure here.
+# Exit codes: 0 = done or nothing to do, 1 = failed or the pulse cannot reach the device (the line says why).
 set -u
-DETECT=$(dirname "$(realpath "$0")")/../detect
-STATE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state
-mkdir -p "$(dirname "$STATE")" || { echo "keepalive: cannot create $(dirname "$STATE")"; exit 1; }
+SELF=$(realpath "$0")
+DETECT=$(dirname "$SELF")/../detect
+RUN=${XDG_RUNTIME_DIR:-/tmp/omarchy-studio-$(id -u)}/omarchy-studio   # runtime dir: gone after a reboot
+PIDF=$RUN/keepalive.pid
+LAST=$RUN/keepalive.last                                              # "<epoch> ok|fail <line>" of the last pulse
+OLD=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state  # left by the old set-and-restore version
+INTERVAL=${KEEPALIVE_INTERVAL:-60}
 
 present() { [ -x "$DETECT" ] && "$DETECT" >/dev/null 2>&1; }
-command -v adi2 >/dev/null 2>&1 || { echo "keepalive: adi2 not installed: nothing to keep awake (install adi2 from adi2-control)"; exit 0; }
-get() { adi2 get device.auto_standby 2>/dev/null | sed -n 's/.*= *//p' | head -1; }
+# the pulse: one read-only query. Kept in this one place so it follows whichever adi2 is on PATH.
+pulse_once() { adi2 status 2>&1 >/dev/null | tail -1; return "${PIPESTATUS[0]}"; }
+running() {  # pid of a live pulse, or nothing (a stale pid file from a kill -9 or crash counts as not running)
+  local p; p=$(cat "$PIDF" 2>/dev/null) || return 1
+  [ -n "$p" ] && tr '\0' ' ' 2>/dev/null < "/proc/$p/cmdline" | grep -q "studio-keepalive _pulse" && echo "$p"
+}
+old_note() { [ -s "$OLD" ] && echo "note: old keepalive.state found (saved auto_standby '$(cat "$OLD")'); not acted on, the pulse never changes the device"; return 0; }
 
 case "${1:-status}" in
+  _pulse)  # the background loop; started by `on`
+    trap 'kill $! 2>/dev/null; rm -f "$PIDF"; exit 0' TERM INT
+    while present; do
+      if line=$(pulse_once); then echo "$(date +%s) ok" > "$LAST"
+      else echo "$(date +%s) fail ${line:-adi2 status failed}" > "$LAST"; fi
+      sleep "$INTERVAL" & wait $!
+    done
+    echo "$(date +%s) gone ADI-2 left USB: pulse stopped, nothing to undo" > "$LAST"; rm -f "$PIDF"
+    ;;
   on)
+    command -v adi2 >/dev/null 2>&1 || { echo "keepalive: adi2 not installed: nothing to keep awake (install adi2 from adi2-control)"; exit 0; }
     present || { echo "keepalive: no RME ADI-2: module off (not on USB: absent, off or in standby; wake it with its button to use keepalive)"; exit 0; }
-    [ -s "$STATE" ] && { echo "keepalive: already on (saved: $(cat "$STATE"))"; exit 0; }
-    cur=$(get)
-    [ -n "$cur" ] || { echo "keepalive: can't read auto_standby (is a DAW holding the ADI-2 MIDI port?)"; exit 1; }
-    echo "$cur" > "$STATE"
-    if [ "$cur" != "off" ]; then
-      adi2 set device.auto_standby off >/dev/null 2>&1; sleep 0.3
-      [ "$(get)" = "off" ] || { echo "keepalive: could not switch auto_standby off"; rm -f "$STATE"; exit 1; }
-    fi
-    echo "keepalive on: ADI-2 auto_standby off (was $cur, restored by: studio-keepalive off)"
+    p=$(running) && { echo "keepalive: already on (pulse pid $p)"; exit 0; }
+    line=$(pulse_once) || { echo "keepalive: the pulse cannot reach the ADI-2: ${line:-adi2 status failed}"; exit 1; }
+    mkdir -p "$RUN" || { echo "keepalive: cannot create $RUN"; exit 1; }
+    echo "$(date +%s) ok" > "$LAST"
+    setsid "$SELF" _pulse </dev/null >/dev/null 2>&1 &
+    echo $! > "$PIDF"
+    echo "keepalive on: MIDI status pulse every ${INTERVAL} s (pid $!); no device setting changed, stop with: studio-keepalive off"
+    old_note
     ;;
   off)
-    [ -s "$STATE" ] || { echo "keepalive: nothing to restore"; exit 0; }
-    saved=$(cat "$STATE")
-    present || { echo "keepalive: no RME ADI-2: module off; will restore auto_standby '$saved' when it is back on USB"; exit 0; }
-    adi2 set device.auto_standby "$saved" >/dev/null 2>&1; sleep 0.3
-    if [ "$(get)" = "$saved" ]; then rm -f "$STATE"; echo "keepalive off: auto_standby restored to $saved"
-    else echo "keepalive: restore to '$saved' not confirmed (DAW holding MIDI?); state kept"; exit 1; fi
+    p=$(running) || { rm -f "$PIDF"; echo "keepalive: not on (nothing to stop, nothing to restore)"; exit 0; }
+    kill "$p"; for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+    kill -0 "$p" 2>/dev/null && { echo "keepalive: pulse pid $p did not stop"; exit 1; }
+    rm -f "$PIDF"
+    echo "keepalive off: pulse stopped; the ADI-2's own standby timer runs again (no device setting was changed)"
     ;;
-  *)
-    if ! present; then
-      [ -s "$STATE" ] && echo "no RME ADI-2: module off (saved auto_standby '$(cat "$STATE")' is restored by the next off)" \
-                      || echo "no RME ADI-2: module off"
-      exit 0
+  status)
+    present || { echo "no RME ADI-2: module off$( [ -s "$OLD" ] && echo " (old keepalive.state with auto_standby '$(cat "$OLD")' found, not acted on)")"; exit 0; }
+    rc=0
+    if p=$(running); then
+      read -r t res rest < "$LAST" 2>/dev/null
+      age=$(( $(date +%s) - ${t:-0} ))
+      if [ "${res:-}" = ok ]; then echo "ADI-2 on USB, keepalive on: pulse pid $p, last reply ${age} s ago"
+      else echo "ADI-2 on USB, keepalive on but NOT keeping it awake: ${rest:-no pulse yet} (${age} s ago)"; rc=1; fi
+    else
+      echo "ADI-2 on USB, keepalive off (its own standby timer applies)"
     fi
-    echo "ADI-2 on USB, auto_standby = $(get || echo '?')"
-    [ -s "$STATE" ] && echo "keepalive active, will restore: $(cat "$STATE")" || echo "keepalive not active"
+    old_note
+    exit $rc
     ;;
+  *) echo "usage: studio-keepalive on|off|status"; exit 1 ;;
 esac
