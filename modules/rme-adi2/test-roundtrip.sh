@@ -78,7 +78,15 @@ LB=$XDG_CONFIG_HOME/pipewire/pipewire.conf.d/50-rme-adi2-stereo.conf
 KA=$XDG_BIN_HOME/studio-keepalive
 # config/pulse is pactl's own cookie (written when a kit tool calls pactl with the scratch XDG_CONFIG_HOME), not the module's
 tree() { (cd "$T" && find config data bin -path config/pulse -prune -o -printf '%y %p\n' | sort); }
-fresh() { rm -rf "${T:?}/config" "${T:?}/data" "${T:?}/bin"; mkdir -p "$T/config" "$T/data" "$T/bin"; }
+# scratch_rm: rm -rf only paths strictly under the checked scratch dir $T; anything else stops the run
+scratch_rm() {
+  local p; for p; do
+    case "$p" in "${T:?}"/?*) ;; *) echo "FAIL  refusing rm -rf outside the scratch dir: '$p'"; exit 1 ;; esac
+    case "/$p/" in */../*) echo "FAIL  refusing rm -rf with .. in '$p'"; exit 1 ;; esac
+    rm -rf -- "$p"
+  done
+}
+fresh() { scratch_rm "$T/config" "$T/data" "$T/bin"; mkdir -p "$T/config" "$T/data" "$T/bin"; }
 # kit tools see the live graph and the live config dir (read only) unless a test points XDG_CONFIG_HOME at scratch
 live() { env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME "$@"; }
 
@@ -121,7 +129,7 @@ STALE_PATH=$T/stub-stale:$ABSENT_PATH
 # prints the sample's JSON line
 watch_sample() {
   local h=${T:?}/home-watch-$1 f i
-  rm -rf "${h:?}"; mkdir -p "$h"
+  scratch_rm "$h"; mkdir -p "$h"
   env HOME="$h" PATH="$2" "$REPO/omarchy-audio-watch" run --interval 60 >"$h/out.log" 2>&1 & WPID=$!
   for i in $(seq 1 60); do
     f=$(ls "$h"/.local/state/omarchy-studio/watch/2*.jsonl 2>/dev/null | head -1)
