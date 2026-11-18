@@ -32,6 +32,10 @@ while [ $# -gt 0 ]; do
     *) echo "usage: $0 [--require-present] [--evidence DIR]"; exit 1 ;;
   esac; shift
 done
+if [ -n "$EVID" ]; then  # the full run output is saved too: DIR/run-<time>.log
+  mkdir -p "$EVID" || exit 1
+  exec > >(tee "$EVID/run-$(date +%Y%m%d-%H%M%S)$([ $REQUIRE_PRESENT = 1 ] && echo -require-present).log") 2>&1
+fi
 LIVE_CONF=${XDG_CONFIG_HOME:-$HOME/.config}
 T=$(mktemp -d "${TMPDIR:-/tmp}/rme-adi2-test.XXXXXX")
 WPID=
@@ -223,6 +227,20 @@ echo "== C: absent state (stub lsusb first on PATH: no 2a39:3fd2), real tools en
 fresh; mkdir -p "$(dirname "$WP")" "$(dirname "$LB")"
 cp "$MOD/files/50-rme-adi2.conf" "$WP"
 sed '/^#@/d; s|RME_ADI-2_Pro__<serial>__<usb-id>|RME_ADI-2_Pro__0000__0000|' "$MOD/files/50-rme-adi2-stereo.conf.in" >"$LB"
+# a second scratch config dir: ONE file holding the RME loopbacks and an unrelated loopback with a known fault
+# (node.dont-reconnect): while the module is off only the RME streams are skipped, the unrelated one is still checked
+MIX=$T/config-mixed/pipewire/pipewire.conf.d/60-mixed.conf; mkdir -p "$(dirname "$MIX")"
+{ sed '/^#@/d; s|RME_ADI-2_Pro__<serial>__<usb-id>|RME_ADI-2_Pro__0000__0000|; $d' "$MOD/files/50-rme-adi2-stereo.conf.in"
+  cat <<'CONF'
+  { name = libpipewire-module-loopback
+    args = {
+      capture.props = { node.name = "other_sink" media.class = "Audio/Sink" }
+      playback.props = { node.name = "other_out" target.object = "alsa_output.pci-0000_00_00.0.analog-stereo" node.dont-reconnect = true }
+    }
+  }
+]
+CONF
+} >"$MIX"
 # stdin: tool text output. True when no line names the RME / ADI-2 other than the one neutral line
 nor() { ! grep -iE 'rme|adi-?2' | grep -v 'no RME ADI-2: module off' | grep -v 'rme-adi2.*\.conf$' | grep -q .; }
 nobad() { ! grep -qE 'Traceback|\[(BREAK|WARN)'; }
@@ -250,17 +268,36 @@ assert not re.search(r"(?i)rme_adi|adi-?2|\brme_", doc), re.findall(r"(?i).{30}(
   out=$(env PATH="$ABSENT_PATH" XDG_CONFIG_HOME=$T/config "$REPO/config-audit" 2>&1); rc=$?
   check "C$i config-audit (scratch dir holding the RME drop-ins): exit 0, 0 WARN/BREAK, exactly one neutral line" \
     bash -c '[ "$1" = 0 ] && ! grep -qE "\[(WARN|BREAK)" <<<"$2" && [ "$(grep -c "no RME ADI-2: module off" <<<"$2")" = 1 ]' _ $rc "$out"
+  out=$(env PATH="$ABSENT_PATH" XDG_CONFIG_HOME=$T/config-mixed "$REPO/config-audit" 2>&1); rc=$?; out=${out//$T/<scratch>}  # the scratch path itself holds "rme"
+  [ $i = 1 ] && echo "$out" | mask
+  check "C$i config-audit (one file: RME loopback + an unrelated stream): the unrelated stream is still checked, the RME one is not" \
+    bash -c '[ "$1" = 0 ] && grep -qE "\[WARN.*other_out.*dont-reconnect" <<<"$2" && ! grep -iE "rme|adi-?2" <<<"$2" | grep -qE "\[(WARN|BREAK)" && [ "$(grep -c "no RME ADI-2: module off" <<<"$2")" = 1 ]' _ $rc "$out"
+  check "C$i module node names count as RME while off (a lingering rme_phones default whose nodes are gone)" env PATH="$ABSENT_PATH" python3 - "$REPO" <<'PYEOF'
+import importlib.machinery, importlib.util, os, re, sys
+def load(f, n):
+    ld = importlib.machinery.SourceFileLoader(n, os.path.join(sys.argv[1], f))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(n, ld)); ld.exec_module(m); return m
+ca = load("config-audit", "ca")
+assert ca.RME_NODES == {"rme_phones", "rme_phones.out", "rme_in", "rme_in.cap"}, ca.RME_NODES
+assert all(ca.is_rme(n) for n in ca.RME_NODES) and not ca.is_rme("alsa_output.pci-0.hdmi") and not ca.is_rme(None)
+ad = open(os.path.join(sys.argv[1], "audio-doctor")).read()  # its default-sink BREAK and --tone gates go through is_rme
+assert "not (not rme_on and confaudit.is_rme(def_sink))" in ad and "if TONE and def_sink and not rme_target(def_sink)" in ad
+assert "def rme_target(n): return n in rme_off or (not rme_on and confaudit.is_rme(n))" in ad
+PYEOF
   out=$(live env PATH="$ABSENT_PATH" "$REPO/whatis" --audio 2>&1); rc=$?
   check "C$i whatis --audio: exit 0, no RME error" bash -c '[ "$1" = 0 ] && ! grep -qiE "traceback|(rme|adi).*(error|fail)" <<<"$2"' _ $rc "$out"
   out=$(watch_sample absent-$i "$ABSENT_PATH"); rc=$?; wshow "$out"
   check "C$i omarchy-audio-watch one real sample: no traceback, 0 RME xrun rows" jrc $rc "$out" 'assert d["xrun_rme_nodes"] == 0, d.get("xrun_rme_nodes")'
   out=$(env HOME="$T/home" PATH="$ABSENT_PATH" "$REPO/audit/footprint" kit-test-$i --secs 2 2>&1); rc=$?
   [ $i = 1 ] && echo "$out" | mask
-  # footprint is not an RME tool (no RME rows, not in this module's gating scope). Its "PipeWire running nodes" line is
-  # the raw graph: in this SIMULATED absence the unit is physically on USB, so its ALSA nodes run and are listed there.
-  # In a real absence (off USB) they do not exist. Asserted: no RME error/BREAK/WARN anywhere, and no RME mention
-  # outside that raw node line.
-  check "C$i audit/footprint: exit 0, no RME error, RME only in the raw running-node list" bash -c '[ "$1" = 0 ] && ! grep -q Traceback <<<"$2" && ! grep -iE "rme|adi-?2" <<<"$2" | grep -v "PipeWire running nodes:" | grep -q . && ! grep -iE "rme|adi-?2" <<<"$2" | grep -qE "BREAK|WARN|rror"' _ $rc "$out"
+  check "C$i audit/footprint: exit 0, no RME node metered or listed, exactly one neutral line" \
+    bash -c '[ "$1" = 0 ] && ! grep -q Traceback <<<"$2" && [ "$(grep -c "no RME ADI-2: module off" <<<"$2")" = 1 ]' _ $rc "$out"
+  check "C$i audit/footprint: no RME row in its text" nor <<<"$out"
+  check "C$i audit/footprint: saved JSON has module off and no ADI-2 / module node" python3 -c '
+import json, re, sys; d = json.load(open(sys.argv[1]))
+assert d["rme_module"] == "off", d["rme_module"]
+bad = [n for n in d["pipewire_running_nodes"] if re.search(r"RME_ADI|(^|[ +])rme_(phones|in)", n)]
+assert not bad, bad' "$T/home/.local/state/omarchy-studio/footprint/kit-test-$i.json"
   out=$(env PATH="$ABSENT_PATH" "$REPO/audit/studio-keepalive" status 2>&1); rc=$?
   check "C$i studio-keepalive status: exit 0, one neutral line ($out)" bash -c '[ "$1" = 0 ] && [ "$(wc -l <<<"$2")" = 1 ]' _ $rc "$out"
   check "C$i omarchy-audio-audit (STUBBED: not executed, audio hold): absent gating, direct ALSA default included" env HOME="$T/home" PATH="$ABSENT_PATH" python3 - "$REPO" <<'EOF'
@@ -271,6 +308,7 @@ oa = importlib.util.module_from_spec(importlib.util.spec_from_loader("oa", ld));
 assert not oa.rme_present()
 hw = "alsa_output.usb-RME_ADI-2_Pro__x-00.pro-output-0"
 cases = [{"default_sink": hw, "hardware_sink": None, "waits_for": None},  # direct ALSA RME default, gone from the graph
+         {"default_sink": "rme_phones", "hardware_sink": None, "waits_for": None},  # module loopback default, nodes gone
          {"default_sink": hw, "hardware_sink": hw, "waits_for": None},    # direct default the chain still names as hw
          {"default_sink": "rme_phones", "hardware_sink": None, "waits_for": hw}]  # loopback waiting for the ADI-2
 for c in cases:

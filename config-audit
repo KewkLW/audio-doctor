@@ -63,8 +63,28 @@ def rme_present():
 RME_OFF = "no RME ADI-2: module off"
 
 
+def rme_module_nodes():
+    """node.names the rme-adi2 module's loopback config defines (rme_phones, rme_phones.out, rme_in, rme_in.cap):
+    read from the module's template so the kit and the module agree; the template's names if it is not found."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+    for t in (os.path.join(here, "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in")):
+        try:
+            names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', open(t).read(), re.M))
+        except OSError:
+            continue
+        if names:
+            return frozenset(names)
+    return frozenset({"rme_phones", "rme_phones.out", "rme_in", "rme_in.cap"})
+
+
+RME_NODES = rme_module_nodes()
+
+
 def is_rme(name):
-    return isinstance(name, str) and "RME_ADI-2" in name
+    """An ADI-2 node (its ALSA nodes) or one of the module's own loopback nodes, even when it no longer exists."""
+    return isinstance(name, str) and ("RME_ADI-2" in name or name in RME_NODES)
 
 
 def truthy(v):
@@ -241,13 +261,13 @@ def audit(dump=None, fix=False, rme=None):
             find("WARN", "dupes", f"node.name '{name}' is defined in {len(set(fs))} files: " + ", ".join(short(f) for f in sorted(set(fs))),
                  "keep one definition", fs[0])
 
-    # RME module off: every stream in a file that targets the ADI-2 (both halves of its loopbacks) is the module's,
-    # so none of its checks run; one neutral line instead.
-    rme_files = {s["file"] for s in streams if is_rme(s["props"].get("target.object") or s["props"].get("node.target"))}
+    # RME module off: a stream is the module's when it targets the ADI-2 or one of the module's loopback nodes, or is
+    # one of those nodes itself; none of its checks run (one neutral line instead). Other streams in the same file are
+    # checked as usual.
     for s in streams:
         p, f, name = s["props"], s["file"], s["node"]
         tgt = p.get("target.object") or p.get("node.target")
-        if not rme and (f in rme_files or is_rme(tgt)):
+        if not rme and (is_rme(tgt) or is_rme(name)):
             rme_skipped = True
             continue
         if "node.target" in p and "target.object" not in p:
@@ -302,7 +322,7 @@ def audit(dump=None, fix=False, rme=None):
         mc = p.get("media.class") or ""
         if not tgt or not mc.startswith("Stream/") or nid in linked:
             continue
-        if not rme and is_rme(tgt):  # a lingering ADI-2 leg while the module is off
+        if not rme and (is_rme(tgt) or is_rme(p.get("node.name"))):  # a lingering ADI-2 leg while the module is off
             rme_skipped = True
             continue
         # target.object is a node.name or an object.serial (NOT an id); node.target is a name or an id

@@ -32,6 +32,28 @@ def meminfo():
             "available_gb": round(m["MemAvailable"] / 2**20, 2), "swap_used_gb": round((m["SwapTotal"] - m["SwapFree"]) / 2**20, 2)}
 
 
+RME_OFF = "no RME ADI-2: module off"
+RME_ON = False  # set in snap() from modules/rme-adi2/detect
+
+
+def rme_present():
+    """RME module contract: RME rows only when modules/rme-adi2/detect says the ADI-2 is on USB (standby = absent).
+    The checkout's module (one level up from audit/), else the installed kit copy. No module = off."""
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    for d in (os.path.join(here, "modules", "rme-adi2", "detect"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "detect")):
+        if os.access(d, os.X_OK):
+            try: return sp.run([d], capture_output=True, timeout=5).returncode == 0
+            except (OSError, sp.TimeoutExpired): return False
+    return False
+
+
+def rme_node(name):
+    """An ADI-2 ALSA node or one of the rme-adi2 module's loopback nodes (rme_phones, rme_in, ...)."""
+    return "RME_ADI" in name or any(t in ("rme_phones", "rme_phones.out", "rme_in", "rme_in.cap") for t in name.split())
+
+
 def pw_top():
     out = sp.run(["pw-top", "-b", "-n", "3"], capture_output=True, text=True, timeout=15).stdout.splitlines()
     rows, hdr = {}, None
@@ -42,10 +64,13 @@ def pw_top():
         h = line[:hdr[0]].split()
         if len(h) < 9 or not h[1].isdigit(): continue
         rows[line[hdr[1]:].strip()] = {"state": h[0], "quant": h[2], "wait": h[4], "busy": h[5], "w/q": h[6], "b/q": h[7], "err": h[8]}
-    return {n: r for n, r in rows.items() if r["state"] == "R"}
+    return {n: r for n, r in rows.items() if r["state"] == "R" and (RME_ON or not rme_node(n))}
 
 
 def snap(name, secs):
+    global RME_ON
+    RME_ON = rme_present()
+    if not RME_ON: print(RME_OFF, flush=True)  # the one neutral line: no ADI-2 node is metered or listed
     hz = os.sysconf("SC_CLK_TCK")
     s0, p0 = [int(x) for x in rd("/proc/stat").splitlines()[0].split()[1:]], proc_times()
     temps, mhz = [], []
@@ -72,6 +97,7 @@ def snap(name, secs):
           "loadavg": rd("/proc/loadavg").split()[:3],
           "pkg_temp_c": {"min": min(temps), "avg": round(sum(temps) / len(temps), 1), "max": max(temps)} if temps else None,
           "avg_core_mhz": round(sum(mhz) / len(mhz)) if mhz else None,
+          "rme_module": "on" if RME_ON else "off",
           "pipewire_running_nodes": pw_top(),
           "pipewire_settings": dict(re.findall(r"key:'(clock\.[^']+)' value:'([^']*)'", sp.run(["pw-metadata", "-n", "settings", "0"], capture_output=True, text=True).stdout)),
           "bitwig_running": bool(sp.run(["pgrep", "-f", "^/opt/bitwig-studio/bin/Bitwig"], capture_output=True).stdout.strip())}
