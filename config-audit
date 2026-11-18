@@ -47,6 +47,46 @@ def run(cmd, timeout=8):
         return sp.CompletedProcess(cmd, 1, "", str(e))
 
 
+def rme_present():
+    """RME module contract: the kit decides its RME rows at run time through modules/rme-adi2/detect
+    (next to this script in a checkout, else the installed kit copy). No module = RME off.
+    Standby drops the ADI-2 off USB, so it counts as absent."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+    for d in (os.path.join(here, "modules", "rme-adi2", "detect"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "detect")):
+        if os.access(d, os.X_OK):
+            return run([d], timeout=5).returncode == 0
+    return False
+
+
+RME_OFF = "no RME ADI-2: module off"
+
+
+def rme_module_nodes():
+    """node.names the rme-adi2 module's loopback config defines (rme_phones, rme_phones.out, rme_in, rme_in.cap):
+    read from the module's template so the kit and the module agree; the template's names if it is not found."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+    for t in (os.path.join(here, "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in")):
+        try:
+            names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', open(t).read(), re.M))
+        except OSError:
+            continue
+        if names:
+            return frozenset(names)
+    return frozenset({"rme_phones", "rme_phones.out", "rme_in", "rme_in.cap"})
+
+
+RME_NODES = rme_module_nodes()
+
+
+def is_rme(name):
+    """An ADI-2 node (its ALSA nodes) or one of the module's own loopback nodes, even when it no longer exists."""
+    return isinstance(name, str) and ("RME_ADI-2" in name or name in RME_NODES)
+
+
 def truthy(v):
     return v is True or str(v).lower() in ("true", "1", "yes")
 
@@ -191,8 +231,10 @@ def relink_cmds(nodes, ports, sid, tid):
 
 
 # ------------------------------------------------------------------ audit
-def audit(dump=None, fix=False):
+def audit(dump=None, fix=False, rme=None):
     findings = []
+    rme = rme_present() if rme is None else rme
+    rme_skipped = False
 
     def find(sev, check, msg, fix_="", where=""):
         findings.append({"severity": sev, "hop": "routing" if check == "live" else "config", "check": check, "message": msg, "fix": fix_, "file": where})
@@ -219,9 +261,15 @@ def audit(dump=None, fix=False):
             find("WARN", "dupes", f"node.name '{name}' is defined in {len(set(fs))} files: " + ", ".join(short(f) for f in sorted(set(fs))),
                  "keep one definition", fs[0])
 
+    # RME module off: a stream is the module's when it targets the ADI-2 or one of the module's loopback nodes, or is
+    # one of those nodes itself; none of its checks run (one neutral line instead). Other streams in the same file are
+    # checked as usual.
     for s in streams:
         p, f, name = s["props"], s["file"], s["node"]
         tgt = p.get("target.object") or p.get("node.target")
+        if not rme and (is_rme(tgt) or is_rme(name)):
+            rme_skipped = True
+            continue
         if "node.target" in p and "target.object" not in p:
             find("INFO", "target", f"'{name}' uses deprecated node.target", "use target.object", f)
         if truthy(p.get("node.dont-reconnect")):
@@ -232,7 +280,7 @@ def audit(dump=None, fix=False):
             find("WARN", "fallback", f"'{name}' has node.dont-fallback without node.linger: WirePlumber destroys it while '{tgt}' is missing",
                  "add node.linger = true", f)
 
-        # target present? if not, why
+        # target present? if not, why.
         if isinstance(tgt, str) and tgt not in by_name:
             m = re.match(r"alsa_(?:output|input)\.(.+)\.([^.]+)$", tgt)
             why = "device absent (off, unplugged or renamed)"
@@ -274,6 +322,9 @@ def audit(dump=None, fix=False):
         mc = p.get("media.class") or ""
         if not tgt or not mc.startswith("Stream/") or nid in linked:
             continue
+        if not rme and (is_rme(tgt) or is_rme(p.get("node.name"))):  # a lingering ADI-2 leg while the module is off
+            rme_skipped = True
+            continue
         # target.object is a node.name or an object.serial (NOT an id); node.target is a name or an id
         tid = by_name.get(tgt)
         if tid is None and str(tgt).isdigit():
@@ -291,6 +342,8 @@ def audit(dump=None, fix=False):
         else:
             find("BREAK", "live", msg, ("audio-doctor --fix  (runs: " + " ; ".join(" ".join(c) for c in cmds) + ")") if cmds else "relink it in qpwgraph")
 
+    if rme_skipped:
+        find("INFO", "rme", RME_OFF, "", "")
     return findings, [short(f) for _, f in files]
 
 

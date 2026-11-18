@@ -1,38 +1,4 @@
 #!/bin/bash
-# studio-keepalive on|off|status : keep the audio interface awake during automated tests.
-# RME ADI-2: switches device.auto_standby off for the run and restores the saved value afterwards.
-# Needs the ADI-2's MIDI port: run `on` BEFORE a DAW starts (Bitwig holds the port) and `off` after it quits.
-# A saved state survives a crashed run: the next `off` (or `on`, which refuses to stack) restores it.
-set -u
-STATE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-studio/keepalive.state
-mkdir -p "$(dirname "$STATE")"
-
-present() { lsusb 2>/dev/null | grep -qi '2a39:'; }
-get() { adi2 get device.auto_standby 2>/dev/null | sed -n 's/.*= *//p' | head -1; }
-
-case "${1:-status}" in
-  on)
-    present || { echo "keepalive: ADI-2 not on USB (in standby or off): wake it with its button or remote first"; exit 2; }
-    [ -s "$STATE" ] && { echo "keepalive: already on (saved: $(cat "$STATE"))"; exit 0; }
-    cur=$(get)
-    [ -n "$cur" ] || { echo "keepalive: can't read auto_standby (is a DAW holding the ADI-2 MIDI port?)"; exit 3; }
-    echo "$cur" > "$STATE"
-    if [ "$cur" != "off" ]; then
-      adi2 set device.auto_standby off >/dev/null 2>&1; sleep 0.3
-      [ "$(get)" = "off" ] || { echo "keepalive: could not switch auto_standby off"; rm -f "$STATE"; exit 4; }
-    fi
-    echo "keepalive on: ADI-2 auto_standby off (was $cur, restored by: studio-keepalive off)"
-    ;;
-  off)
-    [ -s "$STATE" ] || { echo "keepalive: nothing to restore"; exit 0; }
-    saved=$(cat "$STATE")
-    present || { echo "keepalive: ADI-2 not on USB; will restore '$saved' next time"; exit 2; }
-    adi2 set device.auto_standby "$saved" >/dev/null 2>&1; sleep 0.3
-    if [ "$(get)" = "$saved" ]; then rm -f "$STATE"; echo "keepalive off: auto_standby restored to $saved"
-    else echo "keepalive: restore to '$saved' not confirmed (DAW holding MIDI?); state kept"; exit 3; fi
-    ;;
-  *)
-    present && echo "ADI-2 on USB, auto_standby = $(get || echo '?')" || echo "ADI-2 not on USB (standby/off)"
-    [ -s "$STATE" ] && echo "keepalive active, will restore: $(cat "$STATE")" || echo "keepalive not active"
-    ;;
-esac
+# studio-keepalive moved into the RME module (modules/rme-adi2/bin/studio-keepalive). This path stays so
+# existing links and callers keep working.
+exec "$(dirname "$(realpath "$0")")/../modules/rme-adi2/bin/studio-keepalive" "$@"

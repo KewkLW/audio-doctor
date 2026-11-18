@@ -1,0 +1,25 @@
+#!/bin/bash
+# status [--json]: one line per piece (placed / present-identical-not-managed / present-not-ours / missing), plus device and adi2.
+. "$(dirname "$(realpath "$0")")/lib.sh" || { echo "rme-adi2 status: cannot read lib.sh"; exit 1; }
+json=0; [ "${1:-}" = --json ] && json=1
+if on_usb; then dev=present; else dev="absent (off USB or in standby)"; fi
+if command -v adi2 >/dev/null 2>&1; then adi2s=installed; else adi2s="adi2 not installed"; fi
+rows=()
+while IFS='|' read -r name kind src dest; do
+  if ours "$name"; then st=placed
+  elif { [ -e "$dest" ] || [ -L "$dest" ]; } && want=$(render "$kind" "$src") && identical "$kind" "$dest" "$want"; then st=present-identical-not-managed
+  elif [ -e "$dest" ] || [ -L "$dest" ]; then st=present-not-ours
+  else st=missing; fi
+  rows+=("$name|$st|$dest")
+done < <(pieces)
+if [ $json = 1 ]; then
+  python3 -c 'import json,sys
+d,a,rows=sys.argv[1],sys.argv[2],sys.argv[3:]
+print(json.dumps({"module":"rme-adi2","device":d,"adi2":a,"pieces":[dict(zip(("name","state","path"),r.split("|",2))) for r in rows]}))' \
+    "$dev" "$adi2s" "${rows[@]}" || exit 1
+else
+  echo "device: $dev"
+  for r in "${rows[@]}"; do IFS='|' read -r n s p <<<"$r"; echo "$n: $s $p"; done
+  echo "adi2: $adi2s"
+fi
+exit 0

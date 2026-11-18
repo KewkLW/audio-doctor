@@ -179,8 +179,14 @@ def silent(v):
     return v is None or v == float("-inf") or v < SILENT_DB
 
 # ------------------------------------------------------------------ RME ADI-2
-def rme_check(hw):
-    if not any("ADI-2" in c["desc"] for c in hw["alsa_cards"]) or not shutil.which("adi2"):
+def rme_sinks(sinks, by_name):
+    """Sinks that belong to the ADI-2: its own ALSA sinks and loopback sinks whose X.out leg targets it."""
+    return {n for n in sinks if confaudit.is_rme(n) or
+            confaudit.is_rme((by_name.get(n + ".out") or {}).get("props", {}).get("target.object"))}
+
+def rme_check(hw, present):
+    """Only when modules/rme-adi2/detect says the ADI-2 is on USB (standby = absent)."""
+    if not present or not any("ADI-2" in c["desc"] for c in hw["alsa_cards"]) or not shutil.which("adi2"):
         return None
     try:
         state = json.loads(run(["adi2", "dump", "--json"], timeout=12) or "{}")
@@ -219,11 +225,15 @@ def main():
         sys.argv = [sys.argv[0]] + (["--json"] if JSON else []) + (["--fix"] if FIX else [])
         return confaudit.main()
     fixed = []
+    rme_on = confaudit.rme_present()
     if FIX:  # relink first so the measured report shows the repaired graph
-        fixed = [f for f in confaudit.audit(fix=True)[0] if f["check"] == "live"]
+        fixed = [f for f in confaudit.audit(fix=True, rme=rme_on)[0] if f["check"] == "live"]
         time.sleep(0.5)
     svc = services()
     hw = hardware()
+    if not rme_on:  # detect is the module's switch: no ADI-2 hardware row while it says absent
+        hw["usb_audio"] = [u for u in hw["usb_audio"] if "ADI-2" not in u]
+        hw["alsa_cards"] = [c for c in hw["alsa_cards"] if "ADI-2" not in c["desc"]]
     nodes, links, dump = graph()
     wbox = {}
     def _whatis():
@@ -231,7 +241,7 @@ def main():
         wbox["ctx"], wbox["apps"] = ctx, whatis.survey_audio(ctx)
     wt = threading.Thread(target=_whatis); wt.start()
     cbox = {}
-    ct = threading.Thread(target=lambda: cbox.update(f=confaudit.audit(dump)[0])); ct.start()
+    ct = threading.Thread(target=lambda: cbox.update(f=confaudit.audit(dump, rme=rme_on)[0])); ct.start()
     defaults = nodes.pop("_defaults", {})
     def_sink = run(["pactl", "get-default-sink"]).strip() or defaults.get("default.audio.sink")
     sinks = {s["name"]: s for s in pactl_json("sinks")}
@@ -241,9 +251,12 @@ def main():
 
     # card profiles
     for c in cards:
-        if c.get("active_profile") == "off":
+        if c.get("active_profile") == "off" and (rme_on or not confaudit.is_rme(c.get("name"))):
             find("WARN", "hardware", f"card '{c['properties'].get('device.description', c['name'])}' profile is OFF", f"pactl set-card-profile {c['name']} <profile>")
-    if def_sink not in sinks:
+    # RME module off (detect: ADI-2 not on USB, standby included): sinks that belong to the ADI-2 (its ALSA sinks, and
+    # loopback sinks whose .out leg targets it) may linger; none of their checks, nor those of streams into them, run.
+    rme_off = set() if rme_on else rme_sinks(sinks, by_name)
+    if def_sink not in sinks and not (not rme_on and confaudit.is_rme(def_sink)):
         find("BREAK", "routing", f"default sink '{def_sink}' does not exist", "pactl set-default-sink <sink>")
 
     # streams
@@ -293,10 +306,16 @@ def main():
                         "sink": next((x for x in linked if x in sinks), None), "mute": False, "volume_pct": None,
                         "corked": False, "channels": min(out_ports[nid], 8), "linked_to": linked, "api": "jack"})
 
+    # RME module off: streams that play into the ADI-2 and its sinks are dropped here, before metering, so they are
+    # never metered, toned, checked or printed (the one neutral module-off line says why)
+    def rme_target(n): return n in rme_off or (not rme_on and confaudit.is_rme(n))
+    if not rme_on:
+        streams = [s for s in streams if not (rme_target(s["sink"]) or any(rme_target(x) for x in s["linked_to"]))]
     # which sinks to meter: running ones + every sink a stream points at + default
     want_sinks = {s["sink"] for s in streams if s["sink"]} | {def_sink}
     for n, s in sinks.items():
         if s.get("state") == "RUNNING": want_sinks.add(n)
+    want_sinks = {n for n in want_sinks if not rme_target(n)}
     # follow virtual sinks to hardware: sink -> its loopback stream -> hw sink
     hops = {}
     for n in list(want_sinks):
@@ -307,6 +326,9 @@ def main():
             out = by_name.get(n + ".out")
             if out:
                 hw_targets = [nodes[d]["props"].get("node.name") for d in downstream(out["id"], links) if d in nodes]
+                if hw_targets and all(rme_target(h) for h in hw_targets):  # a virtual sink that only feeds the ADI-2
+                    rme_off.add(n); want_sinks.discard(n); continue
+                hw_targets = [h for h in hw_targets if not rme_target(h)]
                 hops[n] = hw_targets
                 want_sinks.update(hw_targets)
 
@@ -317,14 +339,14 @@ def main():
             targets.append(("sink:" + n, n, ch, "sink"))
 
     tone_proc = None
-    if TONE and def_sink:
+    if TONE and def_sink and not rme_target(def_sink):  # never a tone into a lingering ADI-2 sink while the module is off
         tf = os.path.join(tempfile.gettempdir(), "audio-doctor-tone.wav")
         if not os.path.exists(tf):
             sp.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=3,volume=-30dB", "-ac", "2", tf])
         tone_proc = sp.Popen(["pw-play", "--target", def_sink, tf], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
         time.sleep(0.4)
     rme_box = {}
-    rt = threading.Thread(target=lambda: rme_box.update(r=rme_check(hw))); rt.start()
+    rt = threading.Thread(target=lambda: rme_box.update(r=rme_check(hw, rme_on))); rt.start()
     levels = meter(targets)
     if tone_proc:
         tone_proc.terminate()
@@ -356,7 +378,7 @@ def main():
         if s["mute"]: find("BREAK", "stream", f"{tag} is muted in the mixer", f"pactl set-sink-input-mute <idx> 0")
         elif s["volume_pct"] is not None and s["volume_pct"] <= 2: find("BREAK", "stream", f"{tag} volume {s['volume_pct']}%")
         if not s["linked_to"]: find("BREAK", "routing", f"{tag} is not linked to any sink")
-        elif s["sink"] and s["sink"] != def_sink and s.get("api") != "jack": find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
+        elif s["sink"] and s["sink"] != def_sink and not rme_target(def_sink) and s.get("api") != "jack": find("INFO", "routing", f"{tag} plays to '{s['sink']}', not the default '{def_sink}'", f"pactl move-sink-input <idx> {def_sink}")
         if s["corked"]: find("INFO", "stream", f"{tag} is paused (corked) by the app")
         elif silent(s["level"]):
             st = whatis.Proc(int(s["pid"])).start if str(s.get("pid") or "").isdigit() else None
@@ -384,7 +406,7 @@ def main():
         a["has_stream"] = a["pid"] in stream_owners
 
     # tone test
-    if TONE:
+    if TONE and not rme_target(def_sink):
         ok = not silent(sink_info.get(def_sink, {}).get("level"))
         hw_ok = all(not silent(sink_info.get(h, {}).get("level")) for h in (sink_info.get(def_sink, {}).get("feeds_hardware") or [def_sink]))
         if not ok: find("BREAK", "tone", f"test tone did not show up on default sink '{def_sink}'")
@@ -395,12 +417,14 @@ def main():
     ct.join()
     have_live = {f["message"] for f in fixed}
     findings.extend(fixed)
-    findings.extend(f for f in cbox.get("f", []) if f["message"] not in have_live)
+    # the RME-off line is printed once below, not as a finding
+    findings.extend(f for f in cbox.get("f", []) if f["message"] not in have_live and f["message"] != confaudit.RME_OFF)
 
     order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
     findings.sort(key=lambda f: order[f["severity"]])
-    report = {"took_s": round(time.time() - t0, 1), "default_sink": def_sink, "services": svc, "hardware": hw,
-              "sinks": sink_info, "streams": streams, "apps": apps, "rme": rme, "findings": findings}
+    report = {"took_s": round(time.time() - t0, 1), "default_sink": None if rme_target(def_sink) else def_sink, "services": svc, "hardware": hw,
+              "sinks": sink_info, "streams": streams, "apps": apps, "rme": rme,
+              "rme_module": "on" if rme_on else "off", "findings": findings}
     if JSON:
         print(json.dumps(report, indent=1, default=str)); return
     breaks = [f for f in findings if f["severity"] == "BREAK"]
@@ -409,7 +433,7 @@ def main():
         print(f"  [{f['severity']:5}] {f['hop']:8} {f['message']}" + (f"\n{'':18}fix: {f['fix']}" if f["fix"] else ""))
     print(f"\nservices: " + ", ".join(f"{k}={v['state']}" for k, v in svc.items()))
     print("hardware: usb audio = " + (", ".join(hw["usb_audio"]) or "none") + " | bt = " + (", ".join(hw["bt_connected"]) or "none"))
-    print(f"default sink: {def_sink}")
+    print(f"default sink: {def_sink if not rme_target(def_sink) else '(not checked)'}")
     print("\nsinks (measured):")
     for n, s in sink_info.items():
         print(f"  {'*' if s['default'] else ' '} {s['desc'][:48]:48} {s['state']:9} vol {s['volume_pct']}%{' MUTED' if s['mute'] else ''}  level {fmt_db(s['level'])}"
@@ -423,6 +447,10 @@ def main():
     for a in shown:
         state = "STREAMING" if a["has_stream"] else "pipewire client" if a["pw_client"] else "NO pipewire client"
         print(f"  {a['label'][:30]:30} {a['runtime']:16} pid {a['pid']:<8} started {a['start_str'][5:16] if a['start_str'] else '?':11} {state}{'  STALE' if a['stale'] else ''}")
+    if not rme_on:
+        print("\n" + confaudit.RME_OFF)
+    elif not shutil.which("adi2"):
+        print("\nRME ADI-2: on USB; adi2 not installed, device state not read")
     if rme:
         st = rme["status"]
         print(f"\nRME ADI-2: mode {rme['basic_mode']}, knob/line vol {rme['line']['volume']} dB, mute {rme['line']['mute']}, source {rme['line']['source']}, "

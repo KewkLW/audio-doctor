@@ -1,0 +1,54 @@
+# Stereo views of the RME ADI-2 Pro (Pro Audio profile).
+# USB play 1/2 -> Line out 1/2 + Phones 1/2.  USB rec 1/2 -> Analog in 1/2.
+#@ Template: modules/rme-adi2/enable writes it to pipewire.conf.d/50-rme-adi2-stereo.conf with
+#@ RME_ADI-2_Pro__<serial>__<usb-id> replaced by the unit's udev ID_SERIAL (its ALSA node names).
+context.modules = [
+  { name = libpipewire-module-loopback
+    args = {
+      node.description = "RME Phones 1/2"
+      capture.props = {
+        node.name = "rme_phones"
+        media.class = "Audio/Sink"
+        audio.position = [ FL FR ]
+        priority.session = 2100
+      }
+      playback.props = {
+        node.name = "rme_phones.out"
+        audio.position = [ AUX0 AUX1 ]
+        target.object = "alsa_output.usb-RME_ADI-2_Pro__<serial>__<usb-id>-00.pro-output-0"
+        stream.dont-remix = true
+        node.passive = true
+        # Wait for the RME and relink when it comes back (power cycle, replug).
+        # dont-fallback: never play to HDMI/speakers while the RME is off.
+        # linger: REQUIRED with dont-fallback, or WirePlumber destroys this node
+        #   when the RME is missing. Do NOT use node.dont-reconnect here: it
+        #   leaves the loopback unlinked forever after the first disconnect.
+        node.dont-fallback = true
+        node.linger = true
+      }
+    }
+  }
+  { name = libpipewire-module-loopback
+    args = {
+      node.description = "RME In 1/2"
+      capture.props = {
+        node.name = "rme_in.cap"
+        audio.position = [ AUX0 AUX1 ]
+        target.object = "alsa_input.usb-RME_ADI-2_Pro__<serial>__<usb-id>-00.pro-input-0"
+        stream.dont-remix = true
+        node.passive = true
+        # Same as above: wait for the RME and relink when it comes back.
+        # dont-fallback: never record from another mic/source while the RME is off.
+        # linger: REQUIRED with dont-fallback. Never node.dont-reconnect here.
+        node.dont-fallback = true
+        node.linger = true
+      }
+      playback.props = {
+        node.name = "rme_in"
+        media.class = "Audio/Source"
+        audio.position = [ FL FR ]
+        priority.session = 2100
+      }
+    }
+  }
+]
