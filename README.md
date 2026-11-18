@@ -13,7 +13,7 @@ A small diagnostics kit for PipeWire audio on Arch based systems (built on Omarc
 | `omarchy-audio-watch` | Background monitor: every 30 s it logs GPU, CPU, NVMe and xrun counts. `omarchy-audio-watch report out.html` turns the log into a page with charts. Runs as a user service once you start it. |
 | `footprint` | `footprint NAME` snapshots CPU, memory, threads and the PipeWire graph; `footprint compare A B` shows the difference (for example before and after loading a DAW project). |
 
-Each command prints its usage when run with no arguments or with `--help`, except `audio-doctor` and `config-audit`, which simply run (both are read only), and `omarchy-audio-audit`, which starts a full audit with any arguments: read the top of the script for its options before running it.
+Usage: `whatis --help`; `omarchy-audio-watch` and `footprint` with no arguments. `audio-doctor` and `config-audit` run straight away with any arguments (both are read only); their options are at the top of each script. Do not pass `--help` to `omarchy-audio-audit` or `footprint`: the audit starts a full run with any arguments, and `footprint --help` takes a 30 s snapshot named `--help`. Read the top of those scripts for their options.
 
 ## Install
 
@@ -49,7 +49,8 @@ The installer checks these and prints the package to install for anything missin
 | everything (required) | `pw-cli`, `pw-dump`, `pw-top`, `pw-metadata`, `pw-link` | `pipewire` |
 | everything (required) | `wpctl` | `wireplumber` |
 | the audit (required) | `cyclictest` | `rt-tests` |
-| the audit (optional) | `rtla` | not in the Arch repos; AUR, or build it from the kernel source `tools/tracing/rtla` |
+| the audit (optional) | `rtla` | no Arch repo package found; AUR, or build it from the kernel source `tools/tracing/rtla` |
+| the audit (optional) | `turbostat` | `turbostat` |
 | the audit (optional) | `stress-ng` | `stress-ng` |
 
 ## Uninstall
@@ -74,7 +75,9 @@ Things that change something, and only when you ask for them:
 
 ## The one sudo prompt
 
-Only `omarchy-audio-audit` uses sudo, once per run, for its root latency probes: `cyclictest`, `rtla` timerlat, `turbostat` and `lspci` (to read PCIe power states). The root helper only measures; it changes nothing. If sudo is not approved, the audit skips those probes and says so in its report. `omarchy-audio-audit --no-root` skips them from the start. No other command and neither script asks for sudo.
+Only `omarchy-audio-audit` uses sudo, once per run, for its root latency probes: `cyclictest`, `rtla` timerlat, `turbostat` and `lspci` (to read PCIe power states). The root helper only measures; it changes nothing.
+
+How the approval arrives: the audit runs `sudo -S` and does not show a terminal password prompt. It expects sudo to be approved some other way, such as a push approval set up in PAM, or it reads the password from the desktop keyring with `--sudo keyring`. On a stock machine with neither, sudo fails quietly and the audit skips the root probes and says so in its report; everything else in the audit still runs. `omarchy-audio-audit --no-root` skips them on purpose. No other command and neither install script uses sudo.
 
 ## With or without an RME ADI-2 Pro
 

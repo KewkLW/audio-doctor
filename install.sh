@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
     --start) START=yes ;;
     --no-start) START=no ;;
     --force) FORCE=1 ;;
-    --bindir) shift; BIN=${1:?--bindir needs a directory} ;;
+    --bindir) shift; BIN=$(realpath -m -- "${1:?--bindir needs a directory}") ;;
     --check) CHECK_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install.sh: unknown option '$1' (see --help)" >&2; exit 2 ;;
@@ -69,7 +69,8 @@ KIT=(
 check_deps() {
   local req=(python3:python pw-cli:pipewire pw-dump:pipewire pw-top:pipewire pw-metadata:pipewire
              pw-link:pipewire wpctl:wireplumber cyclictest:rt-tests)
-  local opt=("rtla:not in the Arch repos; AUR, or build it from the kernel source tools/tracing/rtla"
+  local opt=("rtla:no Arch repo package found; AUR, or build it from the kernel source tools/tracing/rtla"
+             "turbostat:pacman package: turbostat"
              "stress-ng:pacman package: stress-ng")
   local e cmd pkg miss=() pkgs=()
   echo "Dependencies:"
