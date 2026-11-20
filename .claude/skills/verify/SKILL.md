@@ -69,12 +69,33 @@ the device on USB it reads the ADI-2. Run it only in the audio tier, as the devi
 
 ### The block
 
-Run it from the root of the worktree you changed. It prints every command, its first output lines and
-`exit N`, then a summary. Paste that output (with your worktree path written as `<worktree>`) into the
-evidence.
+Run it as a script from the root of the worktree you changed (it ends with `exit`, so do not paste it
+into your interactive shell). Extract it with patterns anchored to whole lines, so the extract command
+itself can never fall inside the range, into a fresh `mktemp` file that is removed at exit:
+
+```bash
+F=$(mktemp) && trap 'rm -f -- "$F"' EXIT
+sed -n '/^# --- no-audio tier begin ---$/,/^# --- no-audio tier end ---$/p' .claude/skills/verify/SKILL.md >"$F"
+head -3 "$F"    # must be the begin marker and the recursion guard, never a sed line
+grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F" && echo "STOP: the block refers to itself"
+systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F"; echo "block exit $?"
+```
+
+The block reads nothing from this file and never starts itself; its first lines are a recursion guard
+(`VERIFY_NOAUDIO_RUNNING`, exit 2 when already set). Read the extracted file once before the first run.
+The `systemd-run` scope caps the run at 2000 tasks and `timeout` at 10 minutes, so a mistake cannot
+spread. Without a systemd user session, use `(ulimit -u $(( $(ps -u "$(id -u)" -L --no-headers | wc -l) + 2000 )); timeout 600 bash "$F")`:
+`ulimit -u` counts every thread the user already runs, so a flat `ulimit -u 2000` blocks all forks on a
+busy desktop.
+
+It prints every command, its first output lines and `exit N` (the command's own exit code, also for the
+JSON steps), then a summary, and exits 0 only when every step passed (1 when any step failed). Paste that
+output (with your worktree path written as `<worktree>`) into the evidence.
 
 ```bash
 # --- no-audio tier begin ---
+if [ -n "${VERIFY_NOAUDIO_RUNNING:-}" ]; then echo "no-audio block: already running (recursion guard), refusing" >&2; exit 2; fi
+export VERIFY_NOAUDIO_RUNNING=1
 W=$(git rev-parse --show-toplevel) || exit 1
 S=$(mktemp -d /tmp/verify-noaudio.XXXXXX) || exit 1
 mkdir -p "$S/home" "$S/nousb" "$S/guard"; : >"$S/guard/called"
@@ -108,13 +129,15 @@ step "2 shellcheck -S error" 0 shellcheck -S error -e SC1087 "${SH[@]}"
 # 3 install, use and uninstall in a scratch HOME, RME absent
 step "3 tests/install-roundtrip.sh (stub lsusb)" 0 "${G[@]}" bash tests/install-roundtrip.sh
 # 4 every kit command from the worktree, safe modes only
+# JSON modes: keep the command's own exit code; exit 3 if its output is not the expected JSON
+J='o=$("$@"); r=$?; echo "command exit $r"; printf "%s\n" "$o" | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")" || { echo "not the expected JSON"; exit 3; }; exit $r'
 step "4a install.sh --help"            0   "${GH[@]}" "$W/install.sh" --help
 step "4b install.sh --check"           0   "${GH[@]}" "$W/install.sh" --check
 step "4c uninstall.sh --help"          0   "${GH[@]}" "$W/uninstall.sh" --help
 step "4d audio-doctor --audit"         0,1 "${G[@]}" "$W/audio-doctor" --audit
-step "4e audio-doctor --audit --json"  0   "${G[@]}" sh -c '"$1" --audit --json | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")"' _ "$W/audio-doctor"
+step "4e audio-doctor --audit --json"  0   "${G[@]}" bash -c "$J" _ "$W/audio-doctor" --audit --json
 step "4f config-audit"                 0,1 "${G[@]}" "$W/config-audit"
-step "4g config-audit --json"          0   "${G[@]}" sh -c '"$1" --json | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")"' _ "$W/config-audit"
+step "4g config-audit --json"          0   "${G[@]}" bash -c "$J" _ "$W/config-audit" --json
 step "4h whatis --help"                0   "${GH[@]}" "$W/whatis" --help
 step "4i omarchy-audio-audit --help"   0   "${GH[@]}" "$W/omarchy-audio-audit" --help
 step "4j omarchy-audio-audit --no-such-flag" 2 "${GH[@]}" "$W/omarchy-audio-audit" --no-such-flag
@@ -126,8 +149,9 @@ echo; echo "== 5b RME specific commands: skipped (detect reports the device abse
 # 6 nothing that plays audio or reaches the device was called
 step "6 guard stubs unused"            0   sh -c '! [ -s "$1" ] || { cat "$1"; exit 1; }' _ "$S/guard/called"
 echo; echo "== summary"; printf '  %s\n' "${RES[@]}"
-printf '%s\n' "${RES[@]}" | grep -q '^FAIL' && echo "NO-AUDIO TIER RED" || echo "NO-AUDIO TIER GREEN"
+if printf '%s\n' "${RES[@]}" | grep -q '^FAIL'; then RC=1; echo "NO-AUDIO TIER RED"; else RC=0; echo "NO-AUDIO TIER GREEN"; fi
 rm -rf -- "$S"
+exit "$RC"   # nonzero whenever any step failed
 # --- no-audio tier end ---
 ```
 

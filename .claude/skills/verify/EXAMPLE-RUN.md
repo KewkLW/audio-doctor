@@ -3,27 +3,35 @@
 A recorded run of the no-audio block in `SKILL.md`, so a reader (and the reviewer) can see what a
 passing run looks like and that every step really ran. Recorded on the branch that added the skill
 (`b17-verify-pilot-verify-skill-for-audio`), from its worktree root, with the block extracted
-unedited from `SKILL.md` (between its begin and end markers):
+unedited from `SKILL.md` exactly as its "The block" section says:
 
 ```bash
-sed -n '/# --- no-audio tier begin ---/,/# --- no-audio tier end ---/p' .claude/skills/verify/SKILL.md > block.sh
-bash block.sh > run.txt 2>&1; echo "exit $?"
+F=$(mktemp) && trap 'rm -f -- "$F"' EXIT
+sed -n '/^# --- no-audio tier begin ---$/,/^# --- no-audio tier end ---$/p' .claude/skills/verify/SKILL.md >"$F"
+head -3 "$F"    # the begin marker and the recursion guard
+grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F" && echo "STOP: the block refers to itself"   # no output: clean
+systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F" >run.txt 2>&1; echo "block exit $?"
 ```
 
+Before the run the extracted file was read top to bottom (60 lines): it starts with the begin marker
+and the recursion guard and nothing in it reads `SKILL.md` or starts itself. It ran once, under the
+2000 task cap and the 10 minute timeout, and printed `block exit 0`.
+
 The machine has an RME ADI-2 on USB; the block's stub `lsusb` (exits 1) makes the module see it as
-absent, so this is also the run on a machine without the RME. Two runs, both `exit 0`, output
-identical (`diff` empty). The audio tier was not run: the AUDIO HOLD is in force and no device holder
-note exists. No device access, no `adi2` call (it is a logging stub; step 6 proves it was not called).
+absent, so this is also the run on a machine without the RME. The audio tier was not run: the AUDIO
+HOLD is in force and no device holder note exists. No device access, no `adi2` call (it is a logging
+stub; step 6 proves it was not called).
 
 Scrubbing: the block itself writes the worktree as `<worktree>`, its scratch dir as `<scratch>` and
 the home dir as `~`. One more substitution was made here: the path of the installed checkout that
 step 3 prints is written as `<checkout>`.
 
-## Block output (run 1 of 2)
+## Block output
 
 Expected non-zero exits: 5a `detect` exits 1 (stub lsusb: device absent), 4j exits 2 (unknown flag).
 `config-audit` and `audio-doctor --audit` may exit 1 on a BREAK in the live config; here they
-exited 0.
+exited 0. 4e and 4g print `command exit N` first: that is the tool's own exit code, which the step
+reports.
 
 ```text
 
@@ -82,7 +90,8 @@ for f in sys.argv[1:]: ast.parse(open(f).read(), f) audio-doctor audit/boot-inve
    |   [INFO ] rme       no RME ADI-2: module off
    exit 0
 
-== 4e audio-doctor --audit --json: sh -c "$1" --audit --json | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")" _ <worktree>/audio-doctor
+== 4e audio-doctor --audit --json: bash -c o=$("$@"); r=$?; echo "command exit $r"; printf "%s\n" "$o" | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")" || { echo "not the expected JSON"; exit 3; }; exit $r _ <worktree>/audio-doctor --audit --json
+   | command exit 0
    | 7 drop-ins, 1 findings
    exit 0
 
@@ -95,7 +104,8 @@ for f in sys.argv[1:]: ast.parse(open(f).read(), f) audio-doctor audit/boot-inve
    |   [INFO ] rme       no RME ADI-2: module off
    exit 0
 
-== 4g config-audit --json: sh -c "$1" --json | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")" _ <worktree>/config-audit
+== 4g config-audit --json: bash -c o=$("$@"); r=$?; echo "command exit $r"; printf "%s\n" "$o" | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")" || { echo "not the expected JSON"; exit 3; }; exit $r _ <worktree>/config-audit --json
+   | command exit 0
    | 7 drop-ins, 1 findings
    exit 0
 
@@ -174,6 +184,33 @@ for f in sys.argv[1:]: ast.parse(open(f).read(), f) audio-doctor audit/boot-inve
   PASS 6 guard stubs unused (exit 0)
 NO-AUDIO TIER GREEN
 ```
+
+`block exit 0`.
+
+## Guard and failure paths
+
+The recursion guard and the JSON wrapper `J` from the block (taken from the extracted file), checked
+with stand-in commands:
+
+```text
+$ VERIFY_NOAUDIO_RUNNING=1 bash <extracted block>
+no-audio block: already running (recursion guard), refusing
+exit 2
+$ JSON wrapper around a command that prints valid JSON then exits 5
+command exit 5
+0 drop-ins, 0 findings
+exit 5
+$ JSON wrapper around a command that exits 0 with non-JSON output
+command exit 0
+Traceback (most recent call last):
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+not the expected JSON
+exit 3
+```
+
+A nested run refuses with exit 2. A JSON step reports the command's own exit code (5 here, so the
+step fails), and output that is not the expected JSON is exit 3. The block exits `"$RC"`: 1 when any
+step is `FAIL`, 0 only when all pass.
 
 Note on 4d and 4f: with the device absent, `audio-doctor --audit` and `config-audit` still print one
 `[INFO ] rme ... no RME ADI-2: module off` line. That is the tools' behaviour on master (this branch
