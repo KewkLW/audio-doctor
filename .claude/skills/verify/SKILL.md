@@ -1,0 +1,262 @@
+---
+name: verify
+description: Prove a change to audio-doctor works on the real system before committing or submitting it. Use before every commit or bounty submit in this repo, when asked to "verify", "QA", "smoke test" or "check it works", and for any change to the kit commands, install.sh / uninstall.sh, modules/ or tests/. Two tiers. The no-audio tier (syntax, shellcheck, the scratch HOME install roundtrip, every command run from the worktree in its safe modes) is always allowed. The audio tier is gated: only after the AUDIO HOLD is lifted and you are named the RME device holder.
+---
+
+# Verify an audio-doctor change
+
+Prove it on the real system, from the worktree you changed, not from the installed copies. The kit
+commands in `~/.local/bin` may be links into another checkout: always run the worktree's file by its
+path (`$W/audio-doctor`, never `audio-doctor`) and show that path in your evidence.
+
+Unit tests and a green gate are not QA. The no-audio tier below is the minimum for every change; the
+audio tier is the proof for a change to measuring, routing or the RME module, and only when allowed.
+
+## Hard rules (both tiers)
+
+- Never restart PipeWire or pipewire-pulse while apps are open. Not to "reset" a test, not to load a
+  drop-in. If a step seems to need it, stop and report. (A WirePlumber restart is the known fix for RME
+  nodes without ports; that is a repair for the user, not a verify step.)
+- Never raise any volume: not a sink, not a stream, not the device, not a DAW fader, not the RME's
+  line or phones level. You may lower or keep. A signal too quiet to measure is a finding to report, not
+  a reason to turn something up.
+- Never send a write, erase or unknown vendor OUT request to the RME ADI-2. Reads only, and only as the
+  named device holder. No firmware, flash, DSP or EEPROM tools. This holds for every path to the device,
+  the kit's own tools included: no `adi2 set`, and no tool that runs one for you (see the keepalive check
+  in the audio tier).
+- Never touch the live install or the live config: no edits, relinks or deletes in `~/.local/bin`,
+  `~/.local/state/omarchy-studio`, or the live PipeWire / WirePlumber drop-ins. Install tests go into a
+  scratch HOME.
+- Never run a fixing mode as a check: no `--fix` on `audio-doctor` or `config-audit`.
+- Kill only processes you started, by the PID you recorded. Never `pkill` by a pattern.
+- One run is not a result. Repeat a measurement and report both runs before claiming it.
+
+## 1. No-audio tier (always allowed, also under the AUDIO HOLD)
+
+Plays nothing, opens no stream, needs no device, no sudo, no write to the real HOME. Needs `shellcheck`
+installed (step 2 fails without it). It passes on a
+machine without the RME: the block puts a stub `lsusb` that exits 1 first on PATH, so the RME module
+reports absent (the same method as `tests/install-roundtrip.sh`). After `detect` reports the device
+absent, the block runs no RME specific command (no module `status`, no `studio-keepalive`); it prints
+that they were skipped. It also puts logging stubs for
+everything that could play audio or reach the device (`pw-play`, `pw-cat`, `pw-record`, `pw-metadata`,
+`adi2`, `sudo`, `stress-ng`) first on PATH; step 6 fails if any of them was called.
+
+### Safe invocation per command
+
+Several commands have no `--help` branch and treat an unknown argument as a real run. Use only these:
+
+| Command (run as `$W/<path>`)   | Safe here                              | Never in this tier                              |
+|--------------------------------|----------------------------------------|-------------------------------------------------|
+| `audio-doctor`                 | `--audit`, `--audit --json`            | no arguments, `--help` (both meter live streams), `--tone`, `--fix` |
+| `config-audit`                 | no arguments, `--json` (read only)     | `--fix`                                         |
+| `whatis`                       | `--help`                               | (`--audio` / `--gui` read live processes: fine, not needed) |
+| `omarchy-audio-audit`          | `--help` (exit 0), an unknown flag (exit 2) | any real run: it plays a silence stream and sweeps buffer sizes |
+| `omarchy-audio-watch`          | no arguments (prints usage), scratch HOME | `run` (long sampler), `--help` (prints nothing) |
+| `audit/footprint`              | no arguments (prints usage)            | `--help` (taken as a label: a 30 s snapshot)    |
+| `install.sh`                   | `--help`, `--check` (deps only)        | a real install outside a scratch HOME           |
+| `uninstall.sh`                 | `--help`                               | a real uninstall                                |
+| `modules/rme-adi2/detect`      | as is (lsusb / sysfs read only)        |                                                 |
+| `modules/rme-adi2/status`      | not in this tier (skipped once detect says absent) | any run: it reports on the device       |
+| `modules/rme-adi2/bin/studio-keepalive` | not in this tier                | any mode (`on`, `off`, `status`)                |
+
+`config-audit` (and `audio-doctor --audit`) exit 1 when the live config has a BREAK finding. That is a
+result about the machine, not a broken command: exit 0 or 1 with the normal report and no traceback is a
+pass. Anything else (exit 2+, a traceback, no output) is a fail.
+
+`modules/rme-adi2/test-roundtrip.sh` is not in this tier: it runs `audio-doctor`'s live metering, and with
+the device on USB it reads the ADI-2. Run it only in the audio tier, as the device holder.
+
+### The block
+
+Run it as a script from the root of the worktree you changed (it ends with `exit`, so do not paste it
+into your interactive shell). Extract it with patterns anchored to whole lines, so the extract command
+itself can never fall inside the range, into a fresh `mktemp` file that is removed at exit:
+
+```bash
+F=$(mktemp) && trap 'rm -f -- "$F"' EXIT
+sed -n '/^# --- no-audio tier begin ---$/,/^# --- no-audio tier end ---$/p' .claude/skills/verify/SKILL.md >"$F"
+head -3 "$F"    # must be the begin marker and the recursion guard, never a sed line
+if grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F"; then echo "STOP: the block refers to itself, not run"
+else systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F"; echo "block exit $?"; fi
+```
+
+The block reads nothing from this file and never starts itself; its first lines are a recursion guard
+(`VERIFY_NOAUDIO_RUNNING`, exit 2 when already set). Read the extracted file once before the first run.
+The `systemd-run` scope caps the run at 2000 tasks and `timeout` at 10 minutes, so a mistake cannot
+spread. Without a systemd user session, use `(ulimit -u $(( $(ps -u "$(id -u)" -L --no-headers | wc -l) + 2000 )); timeout 600 bash "$F")`:
+`ulimit -u` counts every thread the user already runs, so a flat `ulimit -u 2000` blocks all forks on a
+busy desktop.
+
+It prints every command, its first output lines and `exit N` (the command's own exit code, also for the
+JSON steps; their `--json` modes exit 0 even on a BREAK finding, so 4e and 4g expect 0), then a summary, and exits 0 only when every step passed (1 when any step failed). Paste that
+output (with your worktree path written as `<worktree>`) into the evidence.
+
+```bash
+# --- no-audio tier begin ---
+if [ -n "${VERIFY_NOAUDIO_RUNNING:-}" ]; then echo "no-audio block: already running (recursion guard), refusing" >&2; exit 2; fi
+export VERIFY_NOAUDIO_RUNNING=1
+W=$(git rev-parse --show-toplevel) || exit 1
+S=$(mktemp -d /tmp/verify-noaudio.XXXXXX) || exit 1
+mkdir -p "$S/home" "$S/nousb" "$S/guard"; : >"$S/guard/called"
+printf '#!/bin/sh\nexit 1\n' >"$S/nousb/lsusb"; chmod +x "$S/nousb/lsusb"   # RME absent
+for t in pw-play pw-cat pw-record pw-metadata adi2 sudo stress-ng; do
+  printf '#!/bin/sh\necho "%s $*" >>"%s/guard/called"\nexit 1\n' "$t" "$S" >"$S/guard/$t"; chmod +x "$S/guard/$t"
+done
+G=(env PATH="$S/guard:$S/nousb:$PATH")
+GH=("${G[@]}" HOME="$S/home" XDG_CONFIG_HOME="$S/home/.config" XDG_STATE_HOME="$S/home/.local/state" XDG_DATA_HOME="$S/home/.local/share")
+RES=()
+step() {  # step "N label" OK_CODES cmd...  (OK_CODES like 0 or 0,1)
+  local label=$1 okc=$2 o r a show=() lead=1; shift 2
+  for a in "$@"; do  # print the command without the env assignments (they hold local paths)
+    if [ $lead = 1 ] && { [ "$a" = env ] || [[ $a == [A-Z_]*=* ]]; }; then continue; fi; lead=0; show+=("$a"); done
+  echo; echo "== $label: ${show[*]}" | sed "s|$W|<worktree>|g; s|$S|<scratch>|g; s|$HOME|~|g"
+  o=$("$@" 2>&1); r=$?
+  { echo "$o" | head -3; [ "$(echo "$o" | wc -l)" -gt 5 ] && echo "..."; echo "$o" | tail -n +4 | tail -2; } \
+    | sed "s|$W|<worktree>|g; s|$S|<scratch>|g; s|$HOME|~|g; s/^/   | /"
+  echo "   exit $r"
+  case ",$okc," in *",$r,"*) RES+=("PASS $label (exit $r)") ;; *) RES+=("FAIL $label (exit $r)") ;; esac
+}
+mapfile -t SH < <(cd "$W" && git ls-files | while read -r f; do [ -f "$f" ] && head -1 "$f" | grep -qE '^#!.*(bash|/sh)' && echo "$f"; done)
+mapfile -t PY < <(cd "$W" && git ls-files | while read -r f; do [ -f "$f" ] && { [[ $f == *.py ]] || head -1 "$f" | grep -qE '^#!.*python'; } && echo "$f"; done)
+cd "$W" || exit 1
+# 1 syntax
+step "1a bash -n (${#SH[@]} shell files)" 0 bash -c 'r=0; for f; do bash -n "$f" || r=1; done; exit $r' _ "${SH[@]}"
+step "1b python ast.parse (${#PY[@]} files)" 0 python3 -I -c 'import ast,sys
+for f in sys.argv[1:]: ast.parse(open(f).read(), f)' "${PY[@]}"
+# 2 shellcheck at error level (SC1087 excluded, as the merge gate does)
+step "2 shellcheck -S error" 0 shellcheck -S error -e SC1087 "${SH[@]}"
+# 3 install, use and uninstall in a scratch HOME, RME absent
+step "3 tests/install-roundtrip.sh (stub lsusb)" 0 "${G[@]}" bash tests/install-roundtrip.sh
+# 4 every kit command from the worktree, safe modes only
+# JSON modes: keep the command's own exit code; exit 3 if its output is not the expected JSON
+J='o=$("$@"); r=$?; echo "command exit $r"; printf "%s\n" "$o" | python3 -I -c "import json,sys; d=json.load(sys.stdin); print(len(d[\"files\"]), \"drop-ins,\", len(d[\"findings\"]), \"findings\")" || { echo "not the expected JSON"; exit 3; }; exit $r'
+step "4a install.sh --help"            0   "${GH[@]}" "$W/install.sh" --help
+step "4b install.sh --check"           0   "${GH[@]}" "$W/install.sh" --check
+step "4c uninstall.sh --help"          0   "${GH[@]}" "$W/uninstall.sh" --help
+step "4d audio-doctor --audit"         0,1 "${G[@]}" "$W/audio-doctor" --audit
+step "4e audio-doctor --audit --json"  0   "${G[@]}" bash -c "$J" _ "$W/audio-doctor" --audit --json
+step "4f config-audit"                 0,1 "${G[@]}" "$W/config-audit"
+step "4g config-audit --json"          0   "${G[@]}" bash -c "$J" _ "$W/config-audit" --json
+step "4h whatis --help"                0   "${GH[@]}" "$W/whatis" --help
+step "4i omarchy-audio-audit --help"   0   "${GH[@]}" "$W/omarchy-audio-audit" --help
+step "4j omarchy-audio-audit --no-such-flag" 2 "${GH[@]}" "$W/omarchy-audio-audit" --no-such-flag
+step "4k omarchy-audio-watch (usage)"  0   "${GH[@]}" "$W/omarchy-audio-watch"
+step "4l audit/footprint (usage)"      0   "${GH[@]}" "$W/audit/footprint"
+# 5 RME module: detect must say absent (stub lsusb); then no RME specific command runs
+step "5a rme-adi2/detect (expect 1)"   1   "${GH[@]}" "$W/modules/rme-adi2/detect"
+echo; echo "== 5b RME specific commands: skipped (detect reports the device absent; module status and studio-keepalive are not run)"
+# 6 nothing that plays audio or reaches the device was called
+step "6 guard stubs unused"            0   sh -c '! [ -s "$1" ] || { cat "$1"; exit 1; }' _ "$S/guard/called"
+echo; echo "== summary"; printf '  %s\n' "${RES[@]}"
+if printf '%s\n' "${RES[@]}" | grep -q '^FAIL'; then RC=1; echo "NO-AUDIO TIER RED"; else RC=0; echo "NO-AUDIO TIER GREEN"; fi
+rm -rf -- "$S"
+exit "$RC"   # nonzero whenever any step failed
+# --- no-audio tier end ---
+```
+
+When a step fails, rerun that one command by hand from the worktree and read the full output. Step 3
+takes about half a minute and prints its full log; on a failure read its `FAIL` lines. Do not edit the
+block to make a step pass; fix the change, or report the step as a finding.
+
+If your change adds a command or a flag, add its safe invocation to the table and a step to the block in
+the same change.
+
+### Then the merge gate
+
+```bash
+/path/to/verify-gate.sh     # the board's gate, if your setup has one; expect VERIFY GREEN
+```
+
+It repeats steps 1 to 3 the way the board does on every submit. Green there is required, not sufficient.
+
+## 2. Audio tier (GATED: do not run under the AUDIO HOLD)
+
+Run nothing in this section until both are true, and say which board note says so in your evidence:
+
+1. The orchestrator (Conductor) has lifted the AUDIO HOLD.
+2. A board note from the orchestrator names you the RME device holder. This gate always applies, also
+   when the RME is not detected: no holder note, no audio tier. The ADI-2 is one shared device with one
+   holder at a time. When your hardware session ends, post a progress note that you released it.
+
+With both gates passed, every RME step below still runs only when `$W/modules/rme-adi2/detect` exits 0.
+When it exits 1 (no ADI-2 on USB, off, or in standby), skip every RME step and run no RME specific
+command, and say so in the evidence.
+
+### Before
+
+- Note what is playing and which apps hold audio (`$W/whatis --audio`). Do not stop or reconnect any
+  of them. If a DAW holds the RME's MIDI port, the keepalive cannot run: report it and stop.
+- Take the before state: `$W/audio-doctor --json`, `$W/config-audit --json`, the default sink and its
+  volume (`wpctl get-volume @DEFAULT_AUDIO_SINK@`), the PipeWire and pipewire-pulse PIDs, and the sha256
+  of the live drop-ins. You must find the same values after.
+- RME detected and you are the holder: use `studio-keepalive` to keep the device awake for the run, as
+  on, off and status only. First check that the keepalive in your worktree changes no device setting:
+
+  ```bash
+  grep -nE 'adi2[[:space:]]+set' "$W/modules/rme-adi2/bin/studio-keepalive"
+  ```
+
+  Run `on` / `off` only when both hold: the grep finds nothing (exit 1), and the script's header comment
+  or its `status` output says it never writes a device setting (the MIDI pulse version). Then run
+  `studio-keepalive status`, `studio-keepalive on`, and `status` again to confirm it is active.
+  If it still sets `device.auto_standby` (a grep match, or no such statement), it keeps the device awake
+  by writing a device setting, which the hard rules forbid: do NOT run `on` or `off`. Run the tier
+  without the keepalive (wake the device by its button if it is in standby) and report in the evidence
+  that the keepalive was skipped and why.
+  Check the RME with `adi2` reads only.
+
+### Signal: a loopback in the graph, as its own client, never audible
+
+The test signal never reaches hardware. No sink you did not create, no ALSA sink, not `rme_phones`, not
+the user's default sink, not an app's stream; never move an existing stream. Build a graph internal path
+of your own and remove it by PID when done:
+
+- Create a null sink of your own (a `support.null-audio-sink` node with a unique name such as
+  `verify_null`), started by a process whose PID you record. Right after, check that the default sink is
+  still the one in the before state. If it changed, stop that process at once and report it.
+- Start a `pw-loopback` with its own unique node names (for example `verify_probe` and
+  `verify_probe.out`): its capture side a sink only you use, its playback side targeting `verify_null`
+  and nothing else. Record its PID. Check in `pw-dump` that `verify_probe.out` links only to
+  `verify_null`; any link to an ALSA sink is a stop.
+- Play the test signal into `verify_probe` only, at a fixed low level, with your own player process;
+  record its PID. Never change a sink, stream or device volume.
+- Measure at the hops of your path: `$W/audio-doctor` meters streams, sinks and loopbacks and names the
+  first broken hop; your probe shows as a client like any other. Read levels on `verify_probe` and on
+  the monitor of `verify_null`.
+- The hardware hops (the module's loopback, the ALSA sink, the RME) are checked by graph state only:
+  links, node state and `audio-doctor`'s reading of what the user is already playing. Never send your
+  signal there to make them measurable.
+- Repeat the measurement at least twice, with the same signal and level, and report every run. A result
+  that does not repeat is not a result.
+- Stop your player, your loopback and your null sink by their recorded PIDs. Confirm in `pw-dump` /
+  `audio-doctor` that `verify_probe` and `verify_null` are gone.
+
+`omarchy-audio-audit` itself (buffer sweep, silence stream) is part of this tier, never of the
+no-audio one. It refuses the sweep while a JACK client (a DAW) is connected and restores the clock
+settings it found; still run it only with nothing else playing and the user's consent on the board.
+
+### After
+
+- RME, only if you ran `on`: `studio-keepalive off`, then `status` to confirm it is no longer active.
+- Take the after state and compare it with the before state: same default sink, same volumes, same
+  PipeWire and pipewire-pulse PIDs (no restart), same drop-in hashes, no `verify_probe` node left. Any
+  difference is a finding to report, not something to fix quietly.
+- Post the progress note that you released the device.
+
+## Evidence for `bounty submit --evidence`
+
+- The branch and commit you verified, and that the commands ran from the worktree by path (written as
+  `<worktree>/audio-doctor`, never a real home path).
+- The no-audio block's output: every step with its `exit N`, the summary, and `NO-AUDIO TIER GREEN`.
+  `EXAMPLE-RUN.md` next to this file shows a recorded passing run and the privacy grep.
+  Name the steps that were expected to be non-zero (detect exits 1 with the stub, the unknown flag exits 2,
+  config-audit exits 1 on a BREAK in the live config) and why.
+- The merge gate's last line (`VERIFY GREEN`).
+- The audio tier: either "not run: AUDIO HOLD in force" (or "not the device holder"), or the board note
+  that allowed it, both measurement runs with their numbers, and the before / after comparison.
+- What you did not verify, and why.
+
+No private data in the evidence or in committed files: no home or vault paths, hostnames, IPs, device
+serials, keyring account names, session ids or real names. Use `~`, `<worktree>`, `<host>` and
+placeholders. Raw logs that still hold such values stay outside the repo.
