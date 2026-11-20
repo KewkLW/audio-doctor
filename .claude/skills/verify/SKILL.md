@@ -173,10 +173,13 @@ machine has.
   grep -nE 'adi2[[:space:]]+set' "$W/modules/rme-adi2/bin/studio-keepalive"
   ```
 
-  No match (exit 1): run `studio-keepalive status`, `studio-keepalive on`, then `status` again to confirm
-  it is active. A match means that keepalive keeps the device awake by writing a device setting, which
-  the hard rules forbid: do not run `on` or `off`. Run the tier without the keepalive (wake the device
-  by its button if it is in standby), and say in the evidence that the keepalive was skipped and why.
+  Run `on` / `off` only when both hold: the grep finds nothing (exit 1), and the script's header comment
+  or its `status` output says it never writes a device setting (the MIDI pulse version). Then run
+  `studio-keepalive status`, `studio-keepalive on`, and `status` again to confirm it is active.
+  If it still sets `device.auto_standby` (a grep match, or no such statement), it keeps the device awake
+  by writing a device setting, which the hard rules forbid: do NOT run `on` or `off`. Run the tier
+  without the keepalive (wake the device by its button if it is in standby) and report in the evidence
+  that the keepalive was skipped and why.
   Check the RME with `adi2` reads only.
 
 ### Signal: a loopback in the graph, as its own client
