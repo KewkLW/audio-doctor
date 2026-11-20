@@ -21,7 +21,9 @@ audio tier is the proof for a change to measuring, routing or the RME module, an
   line or phones level. You may lower or keep. A signal too quiet to measure is a finding to report, not
   a reason to turn something up.
 - Never send a write, erase or unknown vendor OUT request to the RME ADI-2. Reads only, and only as the
-  named device holder. No firmware, flash, DSP or EEPROM tools.
+  named device holder. No firmware, flash, DSP or EEPROM tools. This holds for every path to the device,
+  the kit's own tools included: no `adi2 set`, and no tool that runs one for you (see the keepalive check
+  in the audio tier).
 - Never touch the live install or the live config: no edits, relinks or deletes in `~/.local/bin`,
   `~/.local/state/omarchy-studio`, or the live PipeWire / WirePlumber drop-ins. Install tests go into a
   scratch HOME.
@@ -164,10 +166,18 @@ machine has.
 - Take the before state: `$W/audio-doctor --json`, `$W/config-audit --json`, the default sink and its
   volume (`wpctl get-volume @DEFAULT_AUDIO_SINK@`), the PipeWire and pipewire-pulse PIDs, and the sha256
   of the live drop-ins. You must find the same values after.
-- RME detected and you are the holder: `studio-keepalive status`, then `studio-keepalive on` so the
-  device stays awake for the run, then `status` again to confirm it is active. Treat it as on, off and
-  status only; it is the module's tool, not a device setting for you to change. Check the RME with
-  `adi2` reads only.
+- RME detected and you are the holder: use `studio-keepalive` to keep the device awake for the run, as
+  on, off and status only. First check that the keepalive in your worktree changes no device setting:
+
+  ```bash
+  grep -nE 'adi2[[:space:]]+set' "$W/modules/rme-adi2/bin/studio-keepalive"
+  ```
+
+  No match (exit 1): run `studio-keepalive status`, `studio-keepalive on`, then `status` again to confirm
+  it is active. A match means that keepalive keeps the device awake by writing a device setting, which
+  the hard rules forbid: do not run `on` or `off`. Run the tier without the keepalive (wake the device
+  by its button if it is in standby), and say in the evidence that the keepalive was skipped and why.
+  Check the RME with `adi2` reads only.
 
 ### Signal: a loopback in the graph, as its own client
 
@@ -194,7 +204,7 @@ settings it found; still run it only with nothing else playing and the user's co
 
 ### After
 
-- RME: `studio-keepalive off`, then `status` to confirm it is no longer active.
+- RME, only if you ran `on`: `studio-keepalive off`, then `status` to confirm it is no longer active.
 - Take the after state and compare it with the before state: same default sink, same volumes, same
   PipeWire and pipewire-pulse PIDs (no restart), same drop-in hashes, no `verify_probe` node left. Any
   difference is a finding to report, not something to fix quietly.
