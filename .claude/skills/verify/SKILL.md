@@ -77,8 +77,8 @@ itself can never fall inside the range, into a fresh `mktemp` file that is remov
 F=$(mktemp) && trap 'rm -f -- "$F"' EXIT
 sed -n '/^# --- no-audio tier begin ---$/,/^# --- no-audio tier end ---$/p' .claude/skills/verify/SKILL.md >"$F"
 head -3 "$F"    # must be the begin marker and the recursion guard, never a sed line
-grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F" && echo "STOP: the block refers to itself"
-systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F"; echo "block exit $?"
+if grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F"; then echo "STOP: the block refers to itself, not run"
+else systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F"; echo "block exit $?"; fi
 ```
 
 The block reads nothing from this file and never starts itself; its first lines are a recursion guard
@@ -89,7 +89,7 @@ spread. Without a systemd user session, use `(ulimit -u $(( $(ps -u "$(id -u)" -
 busy desktop.
 
 It prints every command, its first output lines and `exit N` (the command's own exit code, also for the
-JSON steps), then a summary, and exits 0 only when every step passed (1 when any step failed). Paste that
+JSON steps; their `--json` modes exit 0 even on a BREAK finding, so 4e and 4g expect 0), then a summary, and exits 0 only when every step passed (1 when any step failed). Paste that
 output (with your worktree path written as `<worktree>`) into the evidence.
 
 ```bash

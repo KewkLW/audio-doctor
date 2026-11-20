@@ -9,13 +9,16 @@ unedited from `SKILL.md` exactly as its "The block" section says:
 F=$(mktemp) && trap 'rm -f -- "$F"' EXIT
 sed -n '/^# --- no-audio tier begin ---$/,/^# --- no-audio tier end ---$/p' .claude/skills/verify/SKILL.md >"$F"
 head -3 "$F"    # the begin marker and the recursion guard
-grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F" && echo "STOP: the block refers to itself"   # no output: clean
-systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F" >run.txt 2>&1; echo "block exit $?"
+if grep -nE 'SKILL\.md|\$F|\$0|BASH_SOURCE' "$F"; then echo "STOP: the block refers to itself, not run"
+else systemd-run --user --scope -q -p TasksMax=2000 timeout 600 bash "$F" >run.txt 2>&1; echo "block exit $?"; fi
 ```
 
 Before the run the extracted file was read top to bottom (60 lines): it starts with the begin marker
-and the recursion guard and nothing in it reads `SKILL.md` or starts itself. It ran once, under the
-2000 task cap and the 10 minute timeout, and printed `block exit 0`.
+and the recursion guard and nothing in it reads `SKILL.md` or starts itself. The self-reference grep
+found nothing. It ran under the 2000 task cap and the 10 minute timeout and printed `block exit 0`;
+a second run (same command) gave the same 18 PASS lines and `block exit 0`. The output below is the
+second run. The cap was checked to hold: the same scope with `TasksMax=5` around a loop of 10
+background `sleep` jobs gave `fork: retry: Resource temporarily unavailable`.
 
 The machine has an RME ADI-2 on USB; the block's stub `lsusb` (exits 1) makes the module see it as
 absent, so this is also the run on a machine without the RME. The audio tier was not run: the AUDIO
