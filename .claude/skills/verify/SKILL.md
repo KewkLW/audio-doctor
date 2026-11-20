@@ -36,7 +36,9 @@ audio tier is the proof for a change to measuring, routing or the RME module, an
 Plays nothing, opens no stream, needs no device, no sudo, no write to the real HOME. Needs `shellcheck`
 installed (step 2 fails without it). It passes on a
 machine without the RME: the block puts a stub `lsusb` that exits 1 first on PATH, so the RME module
-reports absent (the same method as `tests/install-roundtrip.sh`). It also puts logging stubs for
+reports absent (the same method as `tests/install-roundtrip.sh`). After `detect` reports the device
+absent, the block runs no RME specific command (no module `status`, no `studio-keepalive`); it prints
+that they were skipped. It also puts logging stubs for
 everything that could play audio or reach the device (`pw-play`, `pw-cat`, `pw-record`, `pw-metadata`,
 `adi2`, `sudo`, `stress-ng`) first on PATH; step 6 fails if any of them was called.
 
@@ -55,8 +57,8 @@ Several commands have no `--help` branch and treat an unknown argument as a real
 | `install.sh`                   | `--help`, `--check` (deps only)        | a real install outside a scratch HOME           |
 | `uninstall.sh`                 | `--help`                               | a real uninstall                                |
 | `modules/rme-adi2/detect`      | as is (lsusb / sysfs read only)        |                                                 |
-| `modules/rme-adi2/status`      | as is, `--json`                        |                                                 |
-| `modules/rme-adi2/bin/studio-keepalive` | `status`, only with the stub lsusb | `on`, `off`; `status` with the device present (it queries the device) |
+| `modules/rme-adi2/status`      | not in this tier (skipped once detect says absent) | any run: it reports on the device       |
+| `modules/rme-adi2/bin/studio-keepalive` | not in this tier                | any mode (`on`, `off`, `status`)                |
 
 `config-audit` (and `audio-doctor --audit`) exit 1 when the live config has a BREAK finding. That is a
 result about the machine, not a broken command: exit 0 or 1 with the normal report and no traceback is a
@@ -118,11 +120,9 @@ step "4i omarchy-audio-audit --help"   0   "${GH[@]}" "$W/omarchy-audio-audit" -
 step "4j omarchy-audio-audit --no-such-flag" 2 "${GH[@]}" "$W/omarchy-audio-audit" --no-such-flag
 step "4k omarchy-audio-watch (usage)"  0   "${GH[@]}" "$W/omarchy-audio-watch"
 step "4l audit/footprint (usage)"      0   "${GH[@]}" "$W/audit/footprint"
-# 5 RME module with the device absent: detect says absent, nothing is placed, keepalive is neutral
+# 5 RME module: detect must say absent (stub lsusb); then no RME specific command runs
 step "5a rme-adi2/detect (expect 1)"   1   "${GH[@]}" "$W/modules/rme-adi2/detect"
-step "5b rme-adi2/status"              0   "${GH[@]}" "$W/modules/rme-adi2/status"
-step "5c rme-adi2/status --json"       0   "${GH[@]}" "$W/modules/rme-adi2/status" --json
-step "5d studio-keepalive status"      0   "${GH[@]}" "$W/modules/rme-adi2/bin/studio-keepalive" status
+echo; echo "== 5b RME specific commands: skipped (detect reports the device absent; module status and studio-keepalive are not run)"
 # 6 nothing that plays audio or reaches the device was called
 step "6 guard stubs unused"            0   sh -c '! [ -s "$1" ] || { cat "$1"; exit 1; }' _ "$S/guard/called"
 echo; echo "== summary"; printf '  %s\n' "${RES[@]}"
@@ -151,13 +151,13 @@ It repeats steps 1 to 3 the way the board does on every submit. Green there is r
 Run nothing in this section until both are true, and say which board note says so in your evidence:
 
 1. The orchestrator (Conductor) has lifted the AUDIO HOLD.
-2. A board note from the orchestrator names you the RME device holder (only when the RME is detected;
-   with no RME, the hold alone gates this tier). The ADI-2 is one shared device with one holder at a
-   time. When your hardware session ends, post a progress note that you released it.
+2. A board note from the orchestrator names you the RME device holder. This gate always applies, also
+   when the RME is not detected: no holder note, no audio tier. The ADI-2 is one shared device with one
+   holder at a time. When your hardware session ends, post a progress note that you released it.
 
-Every RME step below runs only when `$W/modules/rme-adi2/detect` exits 0. When it exits 1 (no ADI-2 on
-USB, off, or in standby), skip every RME step, say so in the evidence, and verify on whatever output the
-machine has.
+With both gates passed, every RME step below still runs only when `$W/modules/rme-adi2/detect` exits 0.
+When it exits 1 (no ADI-2 on USB, off, or in standby), skip every RME step and run no RME specific
+command, and say so in the evidence.
 
 ### Before
 
@@ -182,24 +182,31 @@ machine has.
   that the keepalive was skipped and why.
   Check the RME with `adi2` reads only.
 
-### Signal: a loopback in the graph, as its own client
+### Signal: a loopback in the graph, as its own client, never audible
 
-Never play a test signal into the user's default sink or into an app's stream, and never move an
-existing stream. Make your own path:
+The test signal never reaches hardware. No sink you did not create, no ALSA sink, not `rme_phones`, not
+the user's default sink, not an app's stream; never move an existing stream. Build a graph internal path
+of your own and remove it by PID when done:
 
+- Create a null sink of your own (a `support.null-audio-sink` node with a unique name such as
+  `verify_null`), started by a process whose PID you record. Right after, check that the default sink is
+  still the one in the before state. If it changed, stop that process at once and report it.
 - Start a `pw-loopback` with its own unique node names (for example `verify_probe` and
-  `verify_probe.out`), its capture side a sink no other app uses and its playback side targeting the
-  output under test (with the RME: the module's loopback node `rme_phones`, which leads to the ADI-2's
-  ALSA sink). Record its PID.
-- Play the test signal into `verify_probe` only, at a fixed low level (about -30 dBFS, like
-  `audio-doctor --tone`), with your own `pw-play` / `pw-cat` process; record its PID. Never change a
-  sink, stream or device volume to make it louder.
-- Measure at the hops you changed: `$W/audio-doctor` meters the app stream, sink, loopback and hardware
-  sink and names the first broken hop. With your loopback running it shows it as a client like any other.
+  `verify_probe.out`): its capture side a sink only you use, its playback side targeting `verify_null`
+  and nothing else. Record its PID. Check in `pw-dump` that `verify_probe.out` links only to
+  `verify_null`; any link to an ALSA sink is a stop.
+- Play the test signal into `verify_probe` only, at a fixed low level, with your own player process;
+  record its PID. Never change a sink, stream or device volume.
+- Measure at the hops of your path: `$W/audio-doctor` meters streams, sinks and loopbacks and names the
+  first broken hop; your probe shows as a client like any other. Read levels on `verify_probe` and on
+  the monitor of `verify_null`.
+- The hardware hops (the module's loopback, the ALSA sink, the RME) are checked by graph state only:
+  links, node state and `audio-doctor`'s reading of what the user is already playing. Never send your
+  signal there to make them measurable.
 - Repeat the measurement at least twice, with the same signal and level, and report every run. A result
   that does not repeat is not a result.
-- Stop your player and your loopback by their recorded PIDs. Confirm in `pw-dump` / `audio-doctor`
-  that `verify_probe` is gone.
+- Stop your player, your loopback and your null sink by their recorded PIDs. Confirm in `pw-dump` /
+  `audio-doctor` that `verify_probe` and `verify_null` are gone.
 
 `omarchy-audio-audit` itself (buffer sweep, silence stream) is part of this tier, never of the
 no-audio one. It refuses the sweep while a JACK client (a DAW) is connected and restores the clock
@@ -218,6 +225,7 @@ settings it found; still run it only with nothing else playing and the user's co
 - The branch and commit you verified, and that the commands ran from the worktree by path (written as
   `<worktree>/audio-doctor`, never a real home path).
 - The no-audio block's output: every step with its `exit N`, the summary, and `NO-AUDIO TIER GREEN`.
+  `EXAMPLE-RUN.md` next to this file shows a recorded passing run and the privacy grep.
   Name the steps that were expected to be non-zero (detect exits 1 with the stub, the unknown flag exits 2,
   config-audit exits 1 on a BREAK in the live config) and why.
 - The merge gate's last line (`VERIFY GREEN`).
