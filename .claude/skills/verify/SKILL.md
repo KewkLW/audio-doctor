@@ -21,8 +21,7 @@ audio tier is the proof for a change to measuring, routing or the RME module, an
   line or phones level. You may lower or keep. A signal too quiet to measure is a finding to report, not
   a reason to turn something up.
 - Never send a write, erase or unknown vendor OUT request to the RME ADI-2. Reads only, and only as the
-  named device holder. No firmware, flash, DSP or EEPROM tools, no `adi2 set` outside what
-  `studio-keepalive` does on its own.
+  named device holder. No firmware, flash, DSP or EEPROM tools.
 - Never touch the live install or the live config: no edits, relinks or deletes in `~/.local/bin`,
   `~/.local/state/omarchy-studio`, or the live PipeWire / WirePlumber drop-ins. Install tests go into a
   scratch HOME.
@@ -32,7 +31,8 @@ audio tier is the proof for a change to measuring, routing or the RME module, an
 
 ## 1. No-audio tier (always allowed, also under the AUDIO HOLD)
 
-Plays nothing, opens no stream, needs no device, no sudo, no write to the real HOME. It passes on a
+Plays nothing, opens no stream, needs no device, no sudo, no write to the real HOME. Needs `shellcheck`
+installed (step 2 fails without it). It passes on a
 machine without the RME: the block puts a stub `lsusb` that exits 1 first on PATH, so the RME module
 reports absent (the same method as `tests/install-roundtrip.sh`). It also puts logging stubs for
 everything that could play audio or reach the device (`pw-play`, `pw-cat`, `pw-record`, `pw-metadata`,
