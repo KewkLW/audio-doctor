@@ -18,9 +18,9 @@ command for the user to run is advice, not a violation.
   a level. Reading a volume is fine.
 - Nothing plays audible signal (`pw-play`, `pw-cat --playback`, `aplay`,
   `paplay`, `speaker-test`, a tone or sweep, a DAW transport start) unless the
-  tool's purpose is playback or the user passes an explicit flag listed in its
-  help (as `audio-doctor --tone`). A stream of zeros that only keeps the graph
-  running is allowed when the tool stops it by its own PID.
+  tool's purpose is playback. A diagnostic, audit, install, watch or test path
+  never plays sound. A stream of zeros that only keeps the graph running is
+  allowed when the tool stops it by its own PID.
 - USB access to the RME is read only. No write, erase or unknown vendor OUT
   control request (host to device, vendor type). Every vendor request a diff
   adds must be a known IN (read) request with a comment naming what it reads.
@@ -55,8 +55,8 @@ command for the user to run is advice, not a violation.
   body is a reject.
 - No weakening: a diff may not loosen an assertion, delete a check, widen a
   match, add `|| true`, skip a case, add sleeps, raise timeouts or retry a
-  step to get green. A flaky test is fixed at its root cause, or deleted with
-  the reason in the commit message.
+  step to get green. A flaky test is fixed at its root cause; deleting or
+  disabling it is a reject.
 
 ## 5. Privacy
 
