@@ -7,14 +7,18 @@ acceptance criteria are otherwise met.
 
 ## 1. Audio safety (hard lines)
 
-- No restart of `pipewire` or `pipewire-pulse` (no `systemctl --user restart`,
-  `stop`, `kill` or `pkill` of them) in any tool, installer or test. New
+These cover commands the code executes. A printed fix hint may name a command
+for the user to run; a hint that suggests a PipeWire restart must say it
+stales every open app's audio.
+
+- No tool, installer or test runs a restart, stop or kill of `pipewire` or
+  `pipewire-pulse` (`systemctl --user restart|stop`, `kill`, `pkill`). New
   PipeWire config takes effect at the next PipeWire start; the tool says so
   instead of forcing it. A WirePlumber restart is allowed only where the diff
   documents it as the fix for RME nodes without ports.
-- No volume raise: no `wpctl set-volume`, `pactl set-sink-volume`, `amixer
-  set` or device control write that can increase a level. Reading a volume is
-  fine; lowering or muting must be what the tool is for.
+- No volume raise: the code never runs `wpctl set-volume`, `pactl
+  set-sink-volume`, `amixer set` or a device control write that can increase
+  a level. Reading a volume is fine.
 - Nothing plays audio (`pw-play`, `aplay`, `paplay`, `speaker-test`, a tone,
   sweep or test stream, a DAW transport start) unless the tool's stated purpose
   is playback. Diagnostics meter existing signal, they never inject it.
