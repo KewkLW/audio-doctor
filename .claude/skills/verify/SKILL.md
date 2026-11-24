@@ -44,16 +44,16 @@ everything that could play audio or reach the device (`pw-play`, `pw-cat`, `pw-r
 
 ### Safe invocation per command
 
-Several commands have no `--help` branch and treat an unknown argument as a real run. Use only these:
+Every kit command now supports `-h` / `--help` (exit 0 without touching audio or starting a run) and rejects unknown flags (exit 2). Use only these in the no-audio tier:
 
 | Command (run as `$W/<path>`)   | Safe here                              | Never in this tier                              |
 |--------------------------------|----------------------------------------|-------------------------------------------------|
-| `audio-doctor`                 | `--audit`, `--audit --json`            | no arguments, `--help` (both meter live streams), `--tone`, `--fix` |
-| `config-audit`                 | no arguments, `--json` (read only)     | `--fix`                                         |
+| `audio-doctor`                 | `--help`, `--no-such-flag` (exit 2), `--audit`, `--audit --json` | no arguments (meters live streams), `--tone`, `--fix` |
+| `config-audit`                 | `--help`, `--no-such-flag` (exit 2), no arguments, `--json` (read only) | `--fix` |
 | `whatis`                       | `--help`                               | (`--audio` / `--gui` read live processes: fine, not needed) |
 | `omarchy-audio-audit`          | `--help` (exit 0), an unknown flag (exit 2) | any real run: it plays a silence stream and sweeps buffer sizes |
-| `omarchy-audio-watch`          | no arguments (prints usage), scratch HOME | `run` (long sampler), `--help` (prints nothing) |
-| `audit/footprint`              | no arguments (prints usage)            | `--help` (taken as a label: a 30 s snapshot)    |
+| `omarchy-audio-watch`          | `--help`, no arguments (prints usage), unknown command (exit 2) | `run` (long sampler) |
+| `audit/footprint`              | `--help`, no arguments (prints usage), unknown flag (exit 2) | `NAME` (30 s snapshot) |
 | `install.sh`                   | `--help`, `--check` (deps only)        | a real install outside a scratch HOME           |
 | `uninstall.sh`                 | `--help`                               | a real uninstall                                |
 | `modules/rme-adi2/detect`      | as is (lsusb / sysfs read only)        |                                                 |
@@ -134,15 +134,22 @@ J='o=$("$@"); r=$?; echo "command exit $r"; printf "%s\n" "$o" | python3 -I -c "
 step "4a install.sh --help"            0   "${GH[@]}" "$W/install.sh" --help
 step "4b install.sh --check"           0   "${GH[@]}" "$W/install.sh" --check
 step "4c uninstall.sh --help"          0   "${GH[@]}" "$W/uninstall.sh" --help
-step "4d audio-doctor --audit"         0,1 "${G[@]}" "$W/audio-doctor" --audit
-step "4e audio-doctor --audit --json"  0   "${G[@]}" bash -c "$J" _ "$W/audio-doctor" --audit --json
-step "4f config-audit"                 0,1 "${G[@]}" "$W/config-audit"
-step "4g config-audit --json"          0   "${G[@]}" bash -c "$J" _ "$W/config-audit" --json
-step "4h whatis --help"                0   "${GH[@]}" "$W/whatis" --help
-step "4i omarchy-audio-audit --help"   0   "${GH[@]}" "$W/omarchy-audio-audit" --help
-step "4j omarchy-audio-audit --no-such-flag" 2 "${GH[@]}" "$W/omarchy-audio-audit" --no-such-flag
-step "4k omarchy-audio-watch (usage)"  0   "${GH[@]}" "$W/omarchy-audio-watch"
-step "4l audit/footprint (usage)"      0   "${GH[@]}" "$W/audit/footprint"
+step "4d audio-doctor --help"          0   "${GH[@]}" "$W/audio-doctor" --help
+step "4e audio-doctor --no-such-flag"  2   "${GH[@]}" "$W/audio-doctor" --no-such-flag
+step "4f audio-doctor --audit"         0,1 "${G[@]}" "$W/audio-doctor" --audit
+step "4g audio-doctor --audit --json"  0   "${G[@]}" bash -c "$J" _ "$W/audio-doctor" --audit --json
+step "4h config-audit --help"          0   "${GH[@]}" "$W/config-audit" --help
+step "4i config-audit --no-such-flag"  2   "${GH[@]}" "$W/config-audit" --no-such-flag
+step "4j config-audit"                 0,1 "${G[@]}" "$W/config-audit"
+step "4k config-audit --json"          0   "${G[@]}" bash -c "$J" _ "$W/config-audit" --json
+step "4l whatis --help"                0   "${GH[@]}" "$W/whatis" --help
+step "4m omarchy-audio-audit --help"   0   "${GH[@]}" "$W/omarchy-audio-audit" --help
+step "4n omarchy-audio-audit --no-such-flag" 2 "${GH[@]}" "$W/omarchy-audio-audit" --no-such-flag
+step "4o omarchy-audio-watch --help"   0   "${GH[@]}" "$W/omarchy-audio-watch" --help
+step "4p omarchy-audio-watch --no-such-flag" 2 "${GH[@]}" "$W/omarchy-audio-watch" --no-such-flag
+step "4q audit/footprint --help"       0   "${GH[@]}" "$W/audit/footprint" --help
+step "4r audit/footprint --no-such-flag" 2 "${GH[@]}" "$W/audit/footprint" --no-such-flag
+step "4s tests/test_cli_safety.py"     0   "${GH[@]}" python3 -I "$W/tests/test_cli_safety.py"
 # 5 RME module: detect must say absent (stub lsusb); then no RME specific command runs
 step "5a rme-adi2/detect (expect 1)"   1   "${GH[@]}" "$W/modules/rme-adi2/detect"
 echo; echo "== 5b RME specific commands: skipped (detect reports the device absent; module status and studio-keepalive are not run)"
