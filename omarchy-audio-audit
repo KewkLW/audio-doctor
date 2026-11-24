@@ -21,7 +21,7 @@ audio-doctor before and after, a JSON file and an HTML report.
   omarchy-audio-audit --daw 60        DAW phase: a JACK client (DAW) must be connected; measures
                                       xruns at the CURRENT size for 60 s per load, never changes it
   omarchy-audio-audit --first-run     write to the 'first-run' slot once (skips if it exists)
-  omarchy-audio-audit --sudo keyring  unattended: sudo password from the keyring instead of ntfy
+  omarchy-audio-audit --sudo MODE     sudo auth: prompt (default on tty), ntfy (PAM push), keyring
   omarchy-audio-audit --label NAME    tag the result dir
   omarchy-audio-audit --no-disk       skip the NVMe cold-read (disk wake) test
   omarchy-audio-audit --disk-path DIR where the disk wake probe file lives (default: the results folder;
@@ -53,7 +53,7 @@ USAGE = """usage: omarchy-audio-audit [options]   (no options: full run, ~12 min
   --sizes LIST        buffer sizes for the sweep, comma separated (default 1024,256,128,64,32)
   --daw SECS          DAW phase: a connected JACK client required; xruns at the CURRENT size for SECS per load
   --first-run         write to the 'first-run' slot once (skips if it exists)
-  --sudo keyring      unattended: sudo password from the keyring instead of ntfy
+  --sudo MODE         sudo auth: prompt (default on tty), ntfy (PAM push), keyring
   --label NAME        tag the result dir
   --no-disk           skip the NVMe cold-read (disk wake) test
   --disk-path DIR     where the disk wake probe file lives (default: the results folder)
@@ -73,6 +73,8 @@ def check_args(argv):
     for i, a in enumerate(argv):
         if not (a in FLAGS or a in VALUE_FLAGS or i > 0 and argv[i - 1] in VALUE_FLAGS):
             return "bad", a
+        if i > 0 and argv[i - 1] == "--sudo" and a not in ("prompt", "ntfy", "keyring"):
+            return "bad", f"--sudo {a} (expected prompt, ntfy, or keyring)"
     return None, None
 
 RME_ON = False  # set in main() from modules/rme-adi2/detect
@@ -110,7 +112,8 @@ def rme_module_nodes():
     for t in (os.path.join(here, "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in"),
               os.path.join(data, "audio-doctor", "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in")):
         try:
-            names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', open(t).read(), re.M))
+            with open(t) as fh:
+                names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', fh.read(), re.M))
         except OSError:
             continue
         if names:
@@ -289,6 +292,8 @@ def pw_top():
         if len(head) < 9 or not head[1].isdigit():
             continue
         name = line[hdr[1]:].strip().lstrip("+").strip()
+        if not RME_ON and ("RME_ADI" in name or name in RME_NODES):
+            continue
         try:
             rows[name] = {"state": head[0], "quant": int(head[2]), "rate": int(head[3]), "bq": head[7], "err": int(head[8])}
         except ValueError:
@@ -699,6 +704,33 @@ th{{background:var(--panel2);font-size:12px;text-transform:uppercase;color:var(-
 
 
 # ====================================================================== main
+def resolve_sudo_mode(opt_val, is_tty):
+    return opt_val or ("prompt" if is_tty else "ntfy")
+
+
+def start_root_helper(outdir, rtla, mode, emit):
+    """Start the read-only root helper via sudo once. Returns (Popen_or_None, err_or_None)."""
+    base_cmd = [sys.executable, os.path.realpath(__file__), "--root-helper", outdir,
+                "--rtla", rtla, "--user", os.environ.get("USER", "")]
+    if mode == "prompt":
+        cached = sp.run(["sudo", "-n", "true"], stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode == 0
+        if not cached:
+            emit("  asking for sudo once for root latency probes...")
+            if sp.run(["sudo", "-v"]).returncode != 0:
+                return None, "sudo authentication cancelled or failed"
+        return sp.Popen(["sudo", "-n"] + base_cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True, bufsize=1), None
+    if mode == "keyring":
+        emit("  asking for sudo (keyring)...")
+        pw = run(["secret-tool", "lookup", "application", "codex", "purpose", "sudo", "account", os.environ.get("USER", "")]).stdout.strip()
+        helper = sp.Popen(["sudo", "-S", "-k", "-p", ""] + base_cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True, bufsize=1)
+        helper.stdin.write(pw + "\n"); helper.stdin.flush(); pw = None
+        return helper, None
+    emit("  asking for sudo (non-interactive PAM/ntfy approval)...")
+    helper = sp.Popen(["sudo", "-S", "-k", "-p", ""] + base_cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True, bufsize=1)
+    helper.stdin.write("\n"); helper.stdin.flush()
+    return helper, None
+
+
 def main():
     kind, tok = check_args(ARGS)
     if kind == "help":
@@ -741,7 +773,7 @@ def main():
     if jack and not daw:
         sweep_block = "skipped: DAW/JACK client(s) connected (" + ", ".join(jack) + "); a buffer change would kill a DAW engine. Quit the DAW, or use --daw."
     if daw and not jack:
-        notes.append("--daw given but no DAW or JACK client is connected: DAW phase skipped. Start the DAW first (omarchy-studio-bitwig 128).")
+        notes.append("--daw given but no DAW or JACK client is connected: DAW phase skipped. Start your DAW first.")
         daw = None
     if daw:
         sweep_block = "skipped in DAW mode (sizes are never changed while a DAW is connected)"
@@ -786,26 +818,23 @@ def main():
     helper = None
     if "--no-root" not in ARGS:
         rtla = shutil.which("rtla") or ""
-        cmd = ["sudo", "-S", "-k", "-p", "", sys.executable, os.path.realpath(__file__), "--root-helper", outdir,
-               "--rtla", rtla, "--user", os.environ.get("USER", "")]
-        emit("  asking for sudo (one approval; ntfy push or keyring)...")
-        helper = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True, bufsize=1)
-        pw = ""
-        if opt("--sudo") == "keyring":
-            pw = run(["secret-tool", "lookup", "application", "codex", "purpose", "sudo", "account", os.environ.get("USER", "")]).stdout.strip()
-        helper.stdin.write(pw + "\n"); helper.stdin.flush(); pw = None
-        line = helper.stdout.readline()
-        if line.strip() != "READY":
-            notes.append("Root latency probes skipped: sudo was not approved (" + (helper.stderr.read()[:200].strip() if helper.poll() is not None else "no answer") + ").")
-            helper.kill(); helper = None
+        mode = resolve_sudo_mode(opt("--sudo"), sys.stdin.isatty() and sys.stdout.isatty())
+        helper, auth_err = start_root_helper(outdir, rtla, mode, emit)
+        if auth_err:
+            notes.append(f"Root latency probes skipped: {auth_err}.")
         else:
-            procs["helper"] = helper
-            emit("  root helper ready")
-            helper.stdin.write("lspci\n"); helper.stdin.flush()
-            while True:
-                l = helper.stdout.readline()
-                if not l or l.startswith("DONE lspci"): break
-            snap["aspm_links"] = parse_aspm(os.path.join(outdir, "raw", "lspci-vvv.txt"))
+            line = helper.stdout.readline()
+            if line.strip() != "READY":
+                notes.append("Root latency probes skipped: sudo was not approved (" + (helper.stderr.read()[:200].strip() if helper.poll() is not None else "no answer") + ").")
+                helper.kill(); helper = None
+            else:
+                procs["helper"] = helper
+                emit("  root helper ready")
+                helper.stdin.write("lspci\n"); helper.stdin.flush()
+                while True:
+                    l = helper.stdout.readline()
+                    if not l or l.startswith("DONE lspci"): break
+                snap["aspm_links"] = parse_aspm(os.path.join(outdir, "raw", "lspci-vvv.txt"))
     else:
         notes.append("Root latency probes skipped (--no-root).")
 

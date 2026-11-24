@@ -39,13 +39,47 @@ whatis = _load("whatis", "whatis")
 confaudit = _load("config-audit", "confaudit")
 
 SILENT_DB = -90.0
-ARGS = sys.argv[1:]
-JSON = "--json" in ARGS
-TONE = "--tone" in ARGS
-SECS = float(ARGS[ARGS.index("--secs") + 1]) if "--secs" in ARGS else 1.0
-APP = ARGS[ARGS.index("--app") + 1].lower() if "--app" in ARGS else None
-AUDIT_ONLY = "--audit" in ARGS
-FIX = "--fix" in ARGS
+FLAGS = ("--json", "--tone", "--audit", "--fix")
+VALUE_FLAGS = ("--app", "--secs")
+USAGE = """usage: audio-doctor [options]   (no options: full hop-by-hop diagnosis, ~3 s, passive)
+  -h, --help          print this and exit (no check)
+  --json              machine-readable JSON output
+  --tone              also play a quiet -30 dBFS 440 Hz tone into the default sink
+  --app NAME          only check streams whose app/media name matches NAME
+  --secs N            metering window in seconds (default 1.0)
+  --audit             config audit only (same as config-audit)
+  --fix               relink streams whose target is present but unlinked, then diagnose
+"""
+ARGS = []
+JSON = False
+TONE = False
+SECS = 1.0
+APP = None
+AUDIT_ONLY = False
+FIX = False
+
+def check_args(argv):
+    for a in argv:
+        if a in ("-h", "--help"):
+            return "help", a
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in FLAGS:
+            i += 1
+        elif a in VALUE_FLAGS:
+            if i + 1 >= len(argv):
+                return "bad", f"{a} requires a value"
+            if a == "--secs":
+                try:
+                    if float(argv[i + 1]) <= 0:
+                        return "bad", f"--secs {argv[i + 1]} (must be > 0)"
+                except ValueError:
+                    return "bad", f"--secs {argv[i + 1]} (not a number)"
+            i += 2
+        else:
+            return "bad", a
+    return None, None
 
 def run(cmd, timeout=6):
     try:
@@ -71,13 +105,27 @@ def services():
 # ------------------------------------------------------------------ hardware
 def hardware():
     cards = []
-    for line in open("/proc/asound/cards").read().splitlines():
+    try:
+        card_lines = open("/proc/asound/cards").read().splitlines()
+    except OSError:
+        card_lines = []
+    for line in card_lines:
         m = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]:\s*(.*)", line)
         if m: cards.append({"index": int(m[1]), "id": m[2], "desc": m[3]})
     usb_audio = []
-    for d in os.listdir("/sys/bus/usb/devices"):
+    try:
+        usb_devs = os.listdir("/sys/bus/usb/devices")
+    except OSError:
+        usb_devs = []
+    for d in usb_devs:
+        if ":" not in d:
+            continue
         p = f"/sys/bus/usb/devices/{d}"
-        if ":" in d and open(f"{p}/bInterfaceClass").read().strip() == "01":
+        try:
+            cls = open(f"{p}/bInterfaceClass").read().strip()
+        except OSError:
+            continue
+        if cls == "01":
             parent = p.rsplit("/", 1)[0] + "/" + d.split(":")[0]
             try: name = open(f"{parent}/product").read().strip()
             except OSError: name = d
@@ -220,6 +268,21 @@ def rme_check(hw, present):
 
 # ------------------------------------------------------------------ main
 def main():
+    global ARGS, JSON, TONE, SECS, APP, AUDIT_ONLY, FIX
+    ARGS = sys.argv[1:]
+    kind, tok = check_args(ARGS)
+    if kind == "help":
+        print(USAGE, end=""); return
+    if kind == "bad":
+        print(f"audio-doctor: unknown argument: {tok}", file=sys.stderr)
+        print(USAGE, end="", file=sys.stderr)
+        sys.exit(2)
+    JSON = "--json" in ARGS
+    TONE = "--tone" in ARGS
+    SECS = float(ARGS[ARGS.index("--secs") + 1]) if "--secs" in ARGS else 1.0
+    APP = ARGS[ARGS.index("--app") + 1].lower() if "--app" in ARGS else None
+    AUDIT_ONLY = "--audit" in ARGS
+    FIX = "--fix" in ARGS
     t0 = time.time()
     if AUDIT_ONLY:
         sys.argv = [sys.argv[0]] + (["--json"] if JSON else []) + (["--fix"] if FIX else [])

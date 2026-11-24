@@ -7,16 +7,17 @@ events.jsonl so before/after is explicit.
   omarchy-audio-watch run [--interval 30]     the sampler (user service: omarchy-audio-watch.service)
   omarchy-audio-watch event "text"            add an event marker
   omarchy-audio-watch report OUT.html [--since 'YYYY-MM-DD HH:MM']   self-contained HTML (inline SVG charts)
+  omarchy-audio-watch -h, --help              print this usage and exit
 
-Per sample: activity tag (idle | gpu-busy | daw | daw+gpu), GPU (clock, mem clock, power, temp, fan, pstate,
-util, throttle reasons), CPU (package temp, throttle-time delta, busy %, avg MHz), every NVMe by serial (temp,
-pm_qos tolerance), RME/Bitwig xrun increases, new kernel Xid lines, own CPU cost.
+Per sample: activity tag (idle | gpu-busy | daw | daw+gpu), GPU (NVIDIA via nvidia-smi if present),
+CPU (package temp, throttle-time delta, busy %, avg MHz), every NVMe by serial (temp, pm_qos tolerance),
+PipeWire audio hardware and DAW xrun increases, new kernel Xid lines, own CPU cost.
 """
 import glob, html, json, os, re, subprocess as sp, sys, time
 
 DIR = os.path.expanduser("~/.local/state/omarchy-studio/watch")
 EVENTS = os.path.join(DIR, "events.jsonl")
-os.makedirs(DIR, exist_ok=True)
+DAW_RE = re.compile(r"bitwig|reaper|ardour|zrythm|carla|qtractor|renoise|lmms|bespoke|ableton|live\.exe|fl64\.exe|studio one|cubase", re.I)
 
 def rd(p, d=""):
     try: return open(p).read().strip()
@@ -32,7 +33,22 @@ def cpu_times():
 
 def pkg_temp():
     for z in glob.glob("/sys/class/thermal/thermal_zone*"):
-        if rd(f"{z}/type") == "x86_pkg_temp": return int(rd(f"{z}/temp", "0")) / 1000
+        if rd(f"{z}/type") == "x86_pkg_temp":
+            v = rd(f"{z}/temp")
+            if v.isdigit(): return int(v) / 1000
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if rd(f"{h}/name") in ("k10temp", "zenpower", "coretemp"):
+            v = rd(f"{h}/temp1_input")
+            if v.isdigit(): return int(v) / 1000
+    r = run(["sensors", "-j"], 5)
+    try:
+        for chip in json.loads(r).values():
+            for k, v in chip.items():
+                if k.startswith(("Package id", "Tctl")):
+                    return next(x for kk, x in v.items() if kk.endswith("_input"))
+    except Exception:
+        pass
+    return None
 
 def gpu():
     q = "clocks.gr,clocks.mem,power.draw,temperature.gpu,fan.speed,pstate,utilization.gpu,clocks_event_reasons.active,persistence_mode"
@@ -63,20 +79,57 @@ def rme_present():
             except Exception: return False
     return False
 
-def pw_errs():
-    rme = rme_present()
-    o = run(["pw-top", "-b", "-n", "2"], 10).splitlines(); rows, hdr = {}, None
-    for l in o:
+def rme_module_nodes():
+    here = os.path.dirname(os.path.realpath(__file__))
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    for t in (os.path.join(here, "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in"),
+              os.path.join(data, "audio-doctor", "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in")):
+        try:
+            with open(t) as f:
+                names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', f.read(), re.M))
+        except OSError:
+            continue
+        if names:
+            return frozenset(names)
+    return frozenset({"rme_phones", "rme_phones.out", "rme_in", "rme_in.cap"})
+
+RME_NODES = rme_module_nodes()
+
+def is_rme_node(nm):
+    return "RME_ADI" in nm or nm in RME_NODES
+
+def pw_errs(rme=None, out=None):
+    """ERR counters from pw-top for active audio hardware drivers and DAW clients.
+    Skips unmeasured frames (W/Q == ???/---) so initial lines do not fake ERR=0 resets.
+    RME nodes (and module loopbacks) are excluded whenever detect reports absent."""
+    if rme is None:
+        rme = rme_present()
+    if out is None:
+        out = run(["pw-top", "-b", "-n", "2"], 10)
+    rows, hdr = {}, None
+    for l in out.splitlines():
         if l.startswith("S ") and "NAME" in l: hdr = (l.index("FORMAT"), l.index("NAME")); continue
         if not hdr or len(l) < hdr[1]: continue
         h = l[:hdr[0]].split()
-        if len(h) >= 9 and h[1].isdigit():
-            nm = l[hdr[1]:].strip().lstrip("+").strip()
-            if ("RME_ADI" in nm and rme) or nm == "Bitwig Studio": rows[f"{nm}#{h[1]}"] = int(h[8])
+        if len(h) < 9 or not h[1].isdigit(): continue
+        if h[6] in ("???", "---"): continue
+        nm = l[hdr[1]:].strip().lstrip("+").strip()
+        if not rme and is_rme_node(nm): continue
+        if nm.startswith(("alsa_output.", "alsa_input.", "bluez_output.", "bluez_input.")) or ("RME_ADI" in nm and rme) or DAW_RE.search(nm):
+            try: rows[f"{nm}#{h[1]}"] = int(h[8])
+            except ValueError: pass
     return rows
 
+def daw_running():
+    for p in os.listdir("/proc"):
+        if not p.isdigit(): continue
+        comm = rd(f"/proc/{p}/comm")
+        if comm and DAW_RE.search(comm): return True
+        if comm in ("BitwigAudioEngi", "BitwigStudio"): return True
+    return False
+
 def activity(g):
-    daw = bool(run(["pgrep", "-x", "BitwigAudioEngi"]).strip()) or bool(run(["pgrep", "-f", "^/opt/bitwig-studio/bin/BitwigStudio"]).strip())
+    daw = daw_running()
     busy = bool(g and (g.get("util") or 0) >= 30)
     return ("daw+gpu" if busy else "daw") if daw else ("gpu-busy" if busy else "idle")
 
@@ -87,6 +140,7 @@ def xid_since(cursor):
     return [l for l in lines if "Xid" in l and not l.startswith("-- ")], new_cursor
 
 def cmd_run(interval):
+    os.makedirs(DIR, exist_ok=True)
     last_tot, last_idle = cpu_times()
     last_thr = int(rd("/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_total_time_ms", "0") or 0)
     last_pw, cursor, tick = {}, None, 0
@@ -114,17 +168,23 @@ def cmd_run(interval):
         time.sleep(max(1, interval - (time.time() - t0)))
 
 def cmd_event(text):
+    os.makedirs(DIR, exist_ok=True)
     with open(EVENTS, "a") as f: f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": text}) + "\n")
 
 def load(since):
     S = []
     for f in sorted(glob.glob(os.path.join(DIR, "*.jsonl"))):
         if f.endswith("events.jsonl"): continue
-        for l in open(f):
-            try: s = json.loads(l)
-            except json.JSONDecodeError: continue
-            if not since or s["ts"] >= since: S.append(s)
-    E = [json.loads(l) for l in open(EVENTS)] if os.path.exists(EVENTS) else []
+        with open(f) as fh:
+            for l in fh:
+                try: s = json.loads(l)
+                except json.JSONDecodeError: continue
+                if not since or s["ts"] >= since: S.append(s)
+    if os.path.exists(EVENTS):
+        with open(EVENTS) as fh:
+            E = [json.loads(l) for l in fh]
+    else:
+        E = []
     return S, [e for e in E if not since or e["ts"] >= since]
 
 def svg(S, E, key, label, unit, color, w=980, h=150):
@@ -150,10 +210,13 @@ def cmd_report(out, since):
     # periods split by events; compare like-for-like activity
     bounds = [S[0]["ts"]] + [ev["ts"] for ev in E if S[0]["ts"] <= ev["ts"] <= S[-1]["ts"]] + [S[-1]["ts"] + "~"]
     names = ["before first event"] + [ev["event"] for ev in E if S[0]["ts"] <= ev["ts"] <= S[-1]["ts"]]
-    metrics = [("GPU power W", lambda s: (s.get("gpu") or {}).get("power_w")), ("GPU temp °C", lambda s: (s.get("gpu") or {}).get("temp")),
-               ("GPU fan %", lambda s: (s.get("gpu") or {}).get("fan")), ("GPU clock MHz", lambda s: (s.get("gpu") or {}).get("clock")),
-               ("CPU temp °C", lambda s: (s.get("cpu") or {}).get("temp")), ("CPU throttle ms/sample", lambda s: (s.get("cpu") or {}).get("throttle_ms")),
-               ("xruns/sample", lambda s: s.get("xruns"))]
+    has_gpu = any(s.get("gpu") for s in S)
+    metrics = []
+    if has_gpu:
+        metrics += [("GPU power W", lambda s: (s.get("gpu") or {}).get("power_w")), ("GPU temp °C", lambda s: (s.get("gpu") or {}).get("temp")),
+                    ("GPU fan %", lambda s: (s.get("gpu") or {}).get("fan")), ("GPU clock MHz", lambda s: (s.get("gpu") or {}).get("clock"))]
+    metrics += [("CPU temp °C", lambda s: (s.get("cpu") or {}).get("temp")), ("CPU throttle ms/sample", lambda s: (s.get("cpu") or {}).get("throttle_ms")),
+                ("xruns/sample", lambda s: s.get("xruns"))]
     for ser in sorted({k for s in S for k in s.get("nvme", {})}):
         mdl = next((s["nvme"][ser]["ctrl"] + " " + s["nvme"][ser]["model"][:18] for s in S if ser in s.get("nvme", {})), ser)
         metrics.append((f"NVMe {mdl} temp °C", lambda s, ser=ser: (s.get("nvme", {}).get(ser) or {}).get("temp")))
@@ -167,15 +230,19 @@ def cmd_report(out, since):
     xid = [x for s in S for x in s.get("xid") or []]
     cost = round(sum(s.get("self_cpu_s", 0) for s in S) / len(S), 3)
     locked = [s for s in S if ((s.get("gpu") or {}).get("clock") or 0) >= 1500 and s["activity"] == "idle"]
-    charts = "".join([svg(S, E, lambda s: (s.get("gpu") or {}).get("power_w"), "GPU power", "W", "#ff9b6b"),
-                      svg(S, E, lambda s: (s.get("gpu") or {}).get("temp"), "GPU temperature", "°C", "#ff7a7a"),
-                      svg(S, E, lambda s: (s.get("gpu") or {}).get("clock"), "GPU clock", "MHz", "#7fb4ff"),
-                      svg(S, E, lambda s: (s.get("gpu") or {}).get("fan"), "GPU fan", "%", "#c79bff"),
-                      svg(S, E, lambda s: (s.get("cpu") or {}).get("temp"), "CPU package temperature", "°C", "#ffd76b"),
-                      svg(S, E, lambda s: (s.get("cpu") or {}).get("throttle_ms"), "CPU thermal throttling per sample", "ms", "#ff7a7a"),
-                      svg(S, E, lambda s: s.get("xruns"), "RME/Bitwig xruns per sample", "", "#7ee0a1")] +
-                     [svg(S, E, lambda s, ser=ser: (s.get("nvme", {}).get(ser) or {}).get("temp"), f"NVMe {next((s['nvme'][ser]['ctrl'] for s in S if ser in s.get('nvme', {})), ser)} temperature", "°C", "#a39a8c")
-                      for ser in sorted({k for s in S for k in s.get("nvme", {})})])
+    chart_list = []
+    if has_gpu:
+        chart_list += [svg(S, E, lambda s: (s.get("gpu") or {}).get("power_w"), "GPU power", "W", "#ff9b6b"),
+                       svg(S, E, lambda s: (s.get("gpu") or {}).get("temp"), "GPU temperature", "°C", "#ff7a7a"),
+                       svg(S, E, lambda s: (s.get("gpu") or {}).get("clock"), "GPU clock", "MHz", "#7fb4ff"),
+                       svg(S, E, lambda s: (s.get("gpu") or {}).get("fan"), "GPU fan", "%", "#c79bff")]
+    chart_list += [svg(S, E, lambda s: (s.get("cpu") or {}).get("temp"), "CPU package temperature", "°C", "#ffd76b"),
+                   svg(S, E, lambda s: (s.get("cpu") or {}).get("throttle_ms"), "CPU thermal throttling per sample", "ms", "#ff7a7a"),
+                   svg(S, E, lambda s: s.get("xruns"), "PipeWire xruns per sample", "", "#7ee0a1")]
+    chart_list += [svg(S, E, lambda s, ser=ser: (s.get("nvme", {}).get(ser) or {}).get("temp"), f"NVMe {next((s['nvme'][ser]['ctrl'] for s in S if ser in s.get('nvme', {})), ser)} temperature", "°C", "#a39a8c")
+                   for ser in sorted({k for s in S for k in s.get("nvme", {})})]
+    charts = "".join(chart_list)
+    gpu_summary = f" · <b>Xid lines:</b> {len(xid)} · <b>idle samples with high GPU clock:</b> {len(locked)}" if has_gpu else ""
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Audio Watch Report</title><style>
 :root{{--bg:#12110f;--panel:#1b1916;--panel2:#23201c;--ink:#ece6dc;--dim:#a39a8c;--line:#3a352e;--acc:#ffb86b;--bad:#ff7a7a}}
 @media (prefers-color-scheme: light){{:root{{--bg:#f7f4ee;--panel:#fff;--panel2:#f1ece3;--ink:#1d1b18;--dim:#6b6358;--line:#d8d0c3;--acc:#c46a12;--bad:#d23c3c}}}}
@@ -185,18 +252,37 @@ h1{{margin:0 0 4px;font-size:26px}}h2{{margin:30px 0 8px;font-size:19px;border-t
 .ax{{fill:var(--dim);font-size:10px}}.ev{{fill:var(--acc);font-size:10px}}.wrap{{overflow-x:auto}}table{{border-collapse:collapse;background:var(--panel);font-size:13px;min-width:100%}}
 th,td{{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}}th{{background:var(--panel2);color:var(--dim);font-size:11px;text-transform:uppercase}}
 .box{{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 14px}}</style></head><body><main>
-<h1>Audio watch: GPU lock + NVMe cap over time</h1>
+<h1>Audio watch report</h1>
 <p class=small>{len(S)} samples, {e(S[0]['ts'])} → {e(S[-1]['ts'])}. Dashed lines = events. Compare rows with the same activity only (idle vs idle).</p>
-<div class=box><b>Negatives watched:</b> GPU idle power, temperature and fan (noise) · CPU temperature and throttling (the CPU is this machine's limit; GPU heat shares the case) · NVMe temperatures (capped drives stay awake) · xruns · kernel GPU errors (Xid; the 4090 runs the tensor unlock). <b>Xid lines:</b> {len(xid)} · <b>idle samples with the GPU clock held high (lock holding):</b> {len(locked)} · <b>monitor cost:</b> {cost} CPU-s per sample.</div>
+<div class=box><b>Metrics watched:</b> CPU temperature and throttling · NVMe temperatures · PipeWire audio xruns{' · GPU power, temp, fan, clock and Xid errors' if has_gpu else ''}.{gpu_summary} · <b>monitor cost:</b> {cost} CPU-s per sample.</div>
 <h2>By period and activity</h2><div class=wrap><table>{tab}</table></div>
 <h2>Over time</h2>{charts}
 {('<h2>Xid</h2><pre>' + e(chr(10).join(xid[-20:])) + '</pre>') if xid else ''}
 </main></body></html>"""
-    open(out, "w").write(page); print(out)
+    with open(out, "w") as fh:
+        fh.write(page)
+    print(out)
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if not a: print(__doc__)
-    elif a[0] == "run": cmd_run(int(a[a.index("--interval") + 1]) if "--interval" in a else 30)
-    elif a[0] == "event": cmd_event(" ".join(a[1:]))
-    elif a[0] == "report": cmd_report(a[1], a[a.index("--since") + 1] if "--since" in a else None)
+    if not a or any(x in ("-h", "--help") for x in a):
+        print(__doc__.strip()); sys.exit(0)
+    elif a[0] == "run":
+        interval = 30
+        if len(a) == 3 and a[1] == "--interval" and a[2].isdigit() and int(a[2]) > 0:
+            interval = int(a[2])
+        elif len(a) != 1:
+            print("omarchy-audio-watch: invalid arguments for run\n" + __doc__.strip(), file=sys.stderr); sys.exit(2)
+        cmd_run(interval)
+    elif a[0] == "event" and len(a) >= 2:
+        cmd_event(" ".join(a[1:]))
+    elif a[0] == "report" and len(a) >= 2:
+        since = None
+        if len(a) == 4 and a[2] == "--since":
+            since = a[3]
+        elif len(a) != 2:
+            print("omarchy-audio-watch: invalid arguments for report\n" + __doc__.strip(), file=sys.stderr); sys.exit(2)
+        cmd_report(a[1], since)
+    else:
+        print(f"omarchy-audio-watch: unknown or incomplete command: {' '.join(a)}\n" + __doc__.strip(), file=sys.stderr)
+        sys.exit(2)

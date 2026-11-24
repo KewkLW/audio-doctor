@@ -67,6 +67,30 @@ def pw_top():
     return {n: r for n, r in rows.items() if r["state"] == "R" and (RME_ON or not rme_node(n))}
 
 
+DAW_RE = re.compile(r"bitwig|reaper|ardour|zrythm|carla|qtractor|renoise|lmms|bespoke|ableton|live\.exe|fl64\.exe|studio one|cubase", re.I)
+
+
+def pkg_temp():
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if rd(f"{z}/type") == "x86_pkg_temp":
+            v = rd(f"{z}/temp")
+            if v.isdigit(): return int(v) / 1000
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if rd(f"{h}/name") in ("k10temp", "zenpower", "coretemp"):
+            v = rd(f"{h}/temp1_input")
+            if v.isdigit(): return int(v) / 1000
+    return None
+
+
+def daw_running():
+    for p in os.listdir("/proc"):
+        if not p.isdigit(): continue
+        comm = rd(f"/proc/{p}/comm")
+        if comm and (DAW_RE.search(comm) or comm in ("BitwigAudioEngi", "BitwigStudio")):
+            return True
+    return False
+
+
 def snap(name, secs):
     global RME_ON
     RME_ON = rme_present()
@@ -76,8 +100,8 @@ def snap(name, secs):
     temps, mhz = [], []
     t_end = time.time() + secs
     while time.time() < t_end:
-        z = next((z for z in glob.glob("/sys/class/thermal/thermal_zone*") if rd(f"{z}/type") == "x86_pkg_temp"), None)
-        if z: temps.append(int(rd(f"{z}/temp")) / 1000)
+        t = pkg_temp()
+        if t is not None: temps.append(t)
         f = [int(rd(c)) for c in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq") if rd(c).isdigit()]
         if f: mhz.append(sum(f) / len(f) / 1000)
         time.sleep(1)
@@ -90,6 +114,7 @@ def snap(name, secs):
             per.setdefault(comm, 0); per[comm] += dt / hz / secs * 100
     top = sorted(per.items(), key=lambda x: -x[1])[:15]
     nthreads = sum(int(m[1]) for p in os.listdir("/proc") if p.isdigit() for m in [re.search(r"Threads:\s+(\d+)", rd(f"/proc/{p}/status"))] if m)
+    daw = daw_running()
     js = {"name": name, "time": time.strftime("%F %T"), "secs": secs,
           "cpu_busy_pct": round(100 * (1 - (d[3] + d[4]) / max(sum(d), 1)), 2),
           "top_cpu_pct_of_one_core": [(c, round(v, 2)) for c, v in top],
@@ -100,13 +125,14 @@ def snap(name, secs):
           "rme_module": "on" if RME_ON else "off",
           "pipewire_running_nodes": pw_top(),
           "pipewire_settings": dict(re.findall(r"key:'(clock\.[^']+)' value:'([^']*)'", sp.run(["pw-metadata", "-n", "settings", "0"], capture_output=True, text=True).stdout)),
+          "daw_running": daw,
           "bitwig_running": bool(sp.run(["pgrep", "-f", "^/opt/bitwig-studio/bin/Bitwig"], capture_output=True).stdout.strip())}
     os.makedirs(DIR, exist_ok=True)
     json.dump(js, open(f"{DIR}/{name}.json", "w"), indent=1)
     m = js["memory"]
     print(f"footprint '{name}' ({secs} s, {js['time']}): CPU busy {js['cpu_busy_pct']}% of all threads, "
           f"memory used {m['used_gb']} / {m['total_gb']} GB (swap {m['swap_used_gb']} GB), {js['processes']} processes / {nthreads} threads, "
-          f"load {' '.join(js['loadavg'])}, package {js['pkg_temp_c']}°C, avg clock {js['avg_core_mhz']} MHz, Bitwig running: {js['bitwig_running']}")
+          f"load {' '.join(js['loadavg'])}, package {js['pkg_temp_c']}°C, avg clock {js['avg_core_mhz']} MHz, DAW running: {js['daw_running']}")
     print("  top CPU (% of one core): " + ", ".join(f"{c} {v}" for c, v in top[:8]))
     print("  PipeWire running nodes: " + (", ".join(f"{n[:40]} q{r['quant']} b/q {r['b/q']}" for n, r in js["pipewire_running_nodes"].items()) or "none (graph idle)"))
 
@@ -129,8 +155,28 @@ def compare(a, b):
     print("  new top CPU in", b + ":", ", ".join(f"{c} {v}" for c, v in B["top_cpu_pct_of_one_core"] if c not in dict(A["top_cpu_pct_of_one_core"]))[:300])
 
 
+USAGE = """usage: footprint NAME [--secs 30] | footprint compare A B
+  -h, --help          print this and exit (no snapshot)
+  NAME [--secs N]     take a system + PipeWire snapshot over N seconds (default 30)
+  compare A B         show the delta between two saved snapshots
+"""
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if not a: print(__doc__)
-    elif a[0] == "compare": compare(a[1], a[2])
-    else: snap(a[0], int(a[a.index("--secs") + 1]) if "--secs" in a else 30)
+    if not a or any(x in ("-h", "--help") for x in a):
+        print(USAGE, end=""); sys.exit(0)
+    elif a[0] == "compare":
+        if len(a) != 3:
+            print("footprint: compare needs two snapshot names\n" + USAGE, end="", file=sys.stderr); sys.exit(2)
+        compare(a[1], a[2])
+    else:
+        name = a[0]
+        if name.startswith("-") or "/" in name or name in (".", ".."):
+            print(f"footprint: invalid snapshot name or option: {name}\n" + USAGE, end="", file=sys.stderr); sys.exit(2)
+        secs = 30
+        if len(a) == 3 and a[1] == "--secs" and a[2].isdigit() and int(a[2]) > 0:
+            secs = int(a[2])
+        elif len(a) != 1:
+            print(f"footprint: unknown arguments: {' '.join(a[1:])}\n" + USAGE, end="", file=sys.stderr); sys.exit(2)
+        snap(name, secs)

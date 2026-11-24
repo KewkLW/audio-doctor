@@ -68,10 +68,14 @@ KIT=(
 # ------------------------------------------------------------------ dependencies
 check_deps() {
   local req=(python3:python pw-cli:pipewire pw-dump:pipewire pw-top:pipewire pw-metadata:pipewire
-             pw-link:pipewire wpctl:wireplumber cyclictest:rt-tests)
+             pw-link:pipewire spa-json-dump:pipewire pw-cat:pipewire-audio pw-play:pipewire-audio
+             pw-record:pipewire-audio wpctl:wireplumber pactl:libpulse lsusb:usbutils cyclictest:rt-tests)
   local opt=("rtla:no Arch repo package found; AUR, or build it from the kernel source tools/tracing/rtla"
              "turbostat:pacman package: turbostat"
-             "stress-ng:pacman package: stress-ng")
+             "stress-ng:pacman package: stress-ng"
+             "lspci:pacman package: pciutils"
+             "sensors:pacman package: lm_sensors"
+             "ffmpeg:pacman package: ffmpeg")
   local e cmd pkg miss=() pkgs=()
   echo "Dependencies:"
   for e in "${req[@]}"; do

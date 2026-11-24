@@ -71,7 +71,8 @@ def rme_module_nodes():
     for t in (os.path.join(here, "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in"),
               os.path.join(data, "audio-doctor", "modules", "rme-adi2", "files", "50-rme-adi2-stereo.conf.in")):
         try:
-            names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', open(t).read(), re.M))
+            with open(t) as fh:
+                names = set(re.findall(r'^\s*node\.name\s*=\s*"([^"]+)"', fh.read(), re.M))
         except OSError:
             continue
         if names:
@@ -257,6 +258,9 @@ def audit(dump=None, fix=False, rme=None):
     prules = profile_rules(files)
 
     for name, fs in names.items():
+        if not rme and is_rme(name):
+            rme_skipped = True
+            continue
         if len(set(fs)) > 1:
             find("WARN", "dupes", f"node.name '{name}' is defined in {len(set(fs))} files: " + ", ".join(short(f) for f in sorted(set(fs))),
                  "keep one definition", fs[0])
@@ -347,8 +351,23 @@ def audit(dump=None, fix=False, rme=None):
     return findings, [short(f) for _, f in files]
 
 
+USAGE = """usage: config-audit [options]   (read-only lint of PipeWire/WirePlumber drop-ins)
+  -h, --help          print this and exit (no check)
+  --fix               relink live streams whose target is present
+  --json              machine-readable JSON output
+"""
+
+
 def main():
     args = sys.argv[1:]
+    for a in args:
+        if a in ("-h", "--help"):
+            print(USAGE, end=""); return
+    for a in args:
+        if a not in ("--fix", "--json"):
+            print(f"config-audit: unknown argument: {a}", file=sys.stderr)
+            print(USAGE, end="", file=sys.stderr)
+            sys.exit(2)
     findings, files = audit(fix="--fix" in args)
     order = {"BREAK": 0, "WARN": 1, "INFO": 2, "OK": 3}
     findings.sort(key=lambda f: order[f["severity"]])
