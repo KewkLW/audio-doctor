@@ -402,17 +402,25 @@ def main():
             targets.append(("sink:" + n, n, ch, "sink"))
 
     tone_proc = None
+    tone_file = None
     if TONE and def_sink and not rme_target(def_sink):  # never a tone into a lingering ADI-2 sink while the module is off
-        tf = os.path.join(tempfile.gettempdir(), "audio-doctor-tone.wav")
-        if not os.path.exists(tf):
-            sp.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=3,volume=-30dB", "-ac", "2", tf])
-        tone_proc = sp.Popen(["pw-play", "--target", def_sink, tf], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        with tempfile.NamedTemporaryFile(prefix="audio-doctor-tone-", suffix=".wav", delete=False) as tf_fh:
+            tone_file = tf_fh.name
+        sp.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=3,volume=-30dB", "-ac", "2", tone_file])
+        tone_proc = sp.Popen(["pw-play", "--target", def_sink, tone_file], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
         time.sleep(0.4)
     rme_box = {}
     rt = threading.Thread(target=lambda: rme_box.update(r=rme_check(hw, rme_on))); rt.start()
-    levels = meter(targets)
-    if tone_proc:
-        tone_proc.terminate()
+    try:
+        levels = meter(targets)
+    finally:
+        if tone_proc:
+            tone_proc.terminate()
+            try: tone_proc.wait(2)
+            except Exception: tone_proc.kill()
+        if tone_file:
+            try: os.unlink(tone_file)
+            except OSError: pass
 
     wt.join()
     ctx, apps = wbox["ctx"], wbox["apps"]

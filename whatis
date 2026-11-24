@@ -536,10 +536,15 @@ def fmt(r, verbose=True):
     return "\n".join(lines)
 
 def main(argv):
+    if any(a in ("-h", "--help") for a in argv):
+        print(__doc__.strip()); return 0
     js = "--json" in argv
     args = [a for a in argv if a != "--json"]
-    if not args or args[0] in ("-h", "--help"):
+    if not args:
         print(__doc__.strip()); return 0
+    if len(args) > 1 or (args[0].startswith("-") and args[0] not in ("--gui", "--audio")):
+        print(f"whatis: unknown argument: {' '.join(args)}\n" + __doc__.strip(), file=sys.stderr)
+        return 2
     ctx = Context()
     if args[0] == "--gui": rows = survey_gui(ctx)
     elif args[0] == "--audio": rows = survey_audio(ctx)

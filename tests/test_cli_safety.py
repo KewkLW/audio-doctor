@@ -85,6 +85,7 @@ class CliHelpAndSafetyTests(unittest.TestCase):
             ("audio-doctor", ("--secs",)),
             ("audio-doctor", ("--secs", "0")),
             ("config-audit", ("--no-such-flag",)),
+            ("whatis", ("--no-such-flag",)),
             ("omarchy-audio-audit", ("--no-such-flag",)),
             ("omarchy-audio-audit", ("--sudo", "bogus")),
             ("omarchy-audio-watch", ("--no-such-flag",)),
