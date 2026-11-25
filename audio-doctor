@@ -242,7 +242,7 @@ def rme_check(hw, present):
     except json.JSONDecodeError:
         find("WARN", "device", "ADI-2 present but did not answer over MIDI", "check MIDI Control is on in the device menu; replug USB")
         return None
-    line, ph12, dev = state.get("line", {}), state.get("ph12", {}), state.get("device", {})
+    line, ph12, ph34, dev = state.get("line", {}), state.get("ph12", {}), state.get("ph34", {}), state.get("device", {})
     out = {"status": st, "line": {k: line.get(k) for k in ("volume", "mute", "dim", "source")},
            "ph12_volume": ph12.get("volume"), "basic_mode": dev.get("basic_mode")}
     if st.get("power_fail"): find("BREAK", "device", "ADI-2 reports POWER FAIL", "check its PSU")
@@ -256,8 +256,15 @@ def rme_check(hw, present):
     if isinstance(v, (int, float)) and v <= -70:
         find("WARN", "device", f"ADI-2 volume (front knob) is {v} dB, effectively inaudible", "turn the knob up (don't let an agent jump it)")
     src = line.get("source")
-    if src not in (None, "auto", "usb1/2"):
-        find("BREAK", "device", f"ADI-2 output 1/2 source is '{src}', not USB", "adi2 set line.source auto")
+    usb = ("auto", "usb1/2")
+    if src not in (None,) + usb:
+        # Deliberate setups (e.g. `adi2 profile load analog-to-line`): line outs play the analog input
+        # while the computer plays to Phones 3/4. Only a BREAK when no output takes USB 1/2 at all.
+        if dev.get("dual_phones") == "on" and ph34.get("source") in usb:
+            find("INFO", "device", f"ADI-2 line outs play '{src}' (deliberate routing); computer audio goes to Phones 3/4")
+        else:
+            find("BREAK", "device", f"ADI-2 output 1/2 source is '{src}' and no output plays USB",
+                 "adi2 profile load usb  (or adi2 set ph34.source usb1/2 to keep the line outs on '" + str(src) + "')")
     return out
 
 # ------------------------------------------------------------------ apps (via whatis)
